@@ -1,0 +1,5 @@
+comment = 'Iceberg Delta table mechanism for openGauss'
+default_version = '1.0'
+module_pathname = '$libdir/iceberg_delta'
+relocatable = false
+schema = iceberg_delta

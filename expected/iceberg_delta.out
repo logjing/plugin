@@ -1,0 +1,136 @@
+-- Test: iceberg_delta extension basic functionality
+
+-- Install extension
+CREATE EXTENSION iceberg_delta;
+
+-- Verify schema and mapping table exist
+SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'iceberg_delta';
+ iceberg_delta
+---------------
+ iceberg_delta
+(1 row)
+
+SELECT tablename FROM pg_tables WHERE tablename = 'mapping' AND schemaname = 'iceberg_delta';
+ tablename
+-----------
+ mapping
+(1 row)
+
+-- Verify FDW and server exist
+SELECT fdwname FROM pg_foreign_data_wrapper WHERE fdwname = 'iceberg_fdw';
+ fdwname
+---------
+ iceberg_fdw
+(1 row)
+
+SELECT srvname FROM pg_foreign_server WHERE srvname = 'iceberg_server';
+ srvname
+---------
+ iceberg_server
+(1 row)
+
+-- Create a foreign table (DDL hook should auto-create Delta internal table)
+CREATE FOREIGN TABLE t_test_insert (
+    id INTEGER,
+    name TEXT,
+    score FLOAT
+) SERVER iceberg_server OPTIONS (warehouse '/data/iceberg', table_name 'test_insert');
+
+-- Verify mapping record was created
+SELECT foreign_relid, delta_schema, delta_name FROM iceberg_delta.mapping;
+ foreign_relid | delta_schema  |   delta_name
+---------------+---------------+---------------
+           XXX | iceberg_delta | delta_XXX
+(1 row)
+
+-- Verify delta_relid option was written to foreign table
+SELECT pg_options_to_table(ftoptions) FROM pg_foreign_table ft
+JOIN pg_class c ON c.oid = ft.ftrelid
+WHERE c.relname = 't_test_insert';
+   option_name   | option_value
+-----------------+--------------
+ warehouse       | /data/iceberg
+ table_name      | test_insert
+ delta_relid     | XXX
+ delta_schema    | iceberg_delta
+ delta_name      | delta_XXX
+(5 rows)
+
+-- Insert data (should be intercepted into Delta internal table)
+INSERT INTO t_test_insert VALUES (1, 'alice', 95.5);
+INSERT INTO t_test_insert VALUES (2, 'bob', 88.0);
+INSERT INTO t_test_insert VALUES (3, 'charlie', 76.5);
+
+-- Query delta table directly to verify data was written
+SELECT delta_schema, delta_name FROM iceberg_delta.mapping WHERE foreign_relid = (
+    SELECT oid FROM pg_class WHERE relname = 't_test_insert'
+);
+ delta_schema  |   delta_name
+---------------+---------------
+ iceberg_delta | delta_XXX
+(1 row)
+
+-- Verify DEPENDENCY_AUTO was registered
+SELECT deptype FROM pg_depend WHERE objid = (
+    SELECT oid FROM pg_class WHERE relname LIKE 'delta_%' AND relnamespace = (
+        SELECT oid FROM pg_namespace WHERE nspname = 'iceberg_delta'
+    )
+) AND refobjid = (
+    SELECT oid FROM pg_class WHERE relname = 't_test_insert'
+);
+ deptype
+---------
+ a
+(1 row)
+
+-- Drop foreign table (should cascade delete Delta internal table + mapping)
+DROP FOREIGN TABLE t_test_insert;
+
+-- Verify mapping record was cleaned up
+SELECT count(*) FROM iceberg_delta.mapping;
+ count
+-------
+     0
+(1 row)
+
+-- Verify delta internal table was auto-cascaded
+SELECT count(*) FROM pg_class WHERE relname LIKE 'delta_%' AND relnamespace = (
+    SELECT oid FROM pg_namespace WHERE nspname = 'iceberg_delta'
+);
+ count
+-------
+     0
+(1 row)
+
+-- Test with multiple inserts in a transaction
+CREATE FOREIGN TABLE t_tx_test (
+    id INTEGER,
+    value TEXT
+) SERVER iceberg_server OPTIONS (warehouse '/data/iceberg', table_name 'tx_test');
+
+BEGIN;
+INSERT INTO t_tx_test VALUES (10, 'in_tx');
+INSERT INTO t_tx_test VALUES (20, 'also_in_tx');
+COMMIT;
+
+-- Verify both rows in delta table
+SELECT delta_schema, delta_name FROM iceberg_delta.mapping WHERE foreign_relid = (
+    SELECT oid FROM pg_class WHERE relname = 't_tx_test'
+);
+ delta_schema  |   delta_name
+---------------+---------------
+ iceberg_delta | delta_XXX
+(1 row)
+
+-- Test rollback
+BEGIN;
+INSERT INTO t_tx_test VALUES (30, 'should_rollback');
+ROLLBACK;
+
+-- Row 30 should not exist in delta table after rollback
+
+-- Cleanup
+DROP FOREIGN TABLE t_tx_test;
+
+-- Uninstall extension
+DROP EXTENSION iceberg_delta CASCADE;
