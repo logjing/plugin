@@ -88,8 +88,8 @@ static void IcebergDeltaUpdateForeignTableOptions(Oid foreign_relid, Oid delta_r
     StringInfoData sql;
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "ALTER FOREIGN TABLE %s.%s SET (delta_relid = '%s', "
-        "delta_schema = '%s', delta_name = '%s')",
+        "ALTER FOREIGN TABLE %s.%s OPTIONS (ADD delta_relid '%s', "
+        "ADD delta_schema '%s', ADD delta_name '%s')",
         quote_identifier(foreign_qualname),
         quote_identifier(foreign_relname),
         relid_str,
@@ -125,8 +125,11 @@ static void IcebergDeltaHandleCreateForeignTable(CreateForeignTableStmt* stmt)
     Oid delta_relid = IcebergDeltaTableCreate(foreign_relid,
                                                kDeltaSchemaName,
                                                delta_name, tupdesc);
+
+    /* Close relation BEFORE SPI ALTER to avoid lock conflict */
+    relation_close(rel, AccessShareLock);
+
     if (!OidIsValid(delta_relid)) {
-        relation_close(rel, AccessShareLock);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("failed to create delta heap table for iceberg foreign table")));
@@ -140,7 +143,6 @@ static void IcebergDeltaHandleCreateForeignTable(CreateForeignTableStmt* stmt)
 
     if (!IcebergCatalogInsertDeltaTableMapping(foreign_relid, delta_relid,
                                                 kDeltaSchemaName, delta_name)) {
-        relation_close(rel, AccessShareLock);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("failed to insert iceberg delta table mapping")));
@@ -148,8 +150,6 @@ static void IcebergDeltaHandleCreateForeignTable(CreateForeignTableStmt* stmt)
 
     IcebergDeltaUpdateForeignTableOptions(foreign_relid, delta_relid,
                                           kDeltaSchemaName, delta_name);
-
-    relation_close(rel, AccessShareLock);
 }
 
 static void IcebergDeltaHandleDropForeignTable(DropStmt* stmt)
@@ -204,12 +204,12 @@ void IcebergDeltaDDLHook(processutility_context* pucontext,
                 }
             }
             if (has_iceberg) {
+                IcebergDeltaHandleDropForeignTable(stmt);
                 CallNextUtility(pucontext, dest,
 #ifdef PGXC
                                 sentToRemote,
 #endif
                                 completionTag, context, isCTAS);
-                IcebergDeltaHandleDropForeignTable(stmt);
                 return;
             }
         }

@@ -162,6 +162,38 @@ gs_ctl restart -D /path/to/datadir
 gsql -d postgres -c "CREATE EXTENSION iceberg_delta;"
 ```
 
+### 环境变量配置
+
+`iceberg_delta_flush` 在向 MinIO/S3 数据湖写数据时需要 S3 凭证。凭证来源优先级为（从高到低）：
+
+1. **外表 options**（`CREATE FOREIGN TABLE ... OPTIONS (s3_endpoint '...', s3_access_key_id '...', s3_secret_access_key '...', s3_region '...')`）——优先级最高，单表覆盖。
+2. **环境变量**——外表未指定 option 时的兜底来源。
+3. **编译期默认值**——仅 `endpoint`（`http://127.0.0.1:19000`）和 `region`（`us-east-1`）有非敏感默认值。
+
+为避免敏感凭证进入源码与仓库，**access key 与 secret access key 不再有硬编码默认值**；若外表 option 与环境变量均未提供，flush 将报错并提示缺失项。
+
+在运行 openGauss 的环境（启动 `gs_ctl` 的 shell，或 systemd unit 的 `Environment=`）中设置以下环境变量：
+
+| 环境变量 | 说明 | 默认值 |
+|---|---|---|
+| `ICEBERG_S3_ENDPOINT` | MinIO/S3 端点 URL | `http://127.0.0.1:19000` |
+| `ICEBERG_S3_ACCESS_KEY_ID` | 访问密钥 ID | **无（必填）** |
+| `ICEBERG_S3_SECRET_ACCESS_KEY` | 访问密钥 | **无（必填）** |
+| `ICEBERG_S3_REGION` | region | `us-east-1` |
+
+```bash
+# 在启动 openGauss 的 shell 中设置（gs_ctl 继承这些变量）
+export ICEBERG_S3_ENDPOINT="http://172.168.22.25:19000"
+export ICEBERG_S3_ACCESS_KEY_ID="your-access-key"
+export ICEBERG_S3_SECRET_ACCESS_KEY="your-secret-key"
+export ICEBERG_S3_REGION="us-east-1"
+export ICEBERG_S3_BUCKET="your-bucket"
+
+gs_ctl restart -D /path/to/datadir
+```
+
+> 端到端测试脚本 `test_flush_e2e.sh` 同样读取上述环境变量（其中 `ICEBERG_S3_BUCKET` 用于指定 bucket）。access key / secret 未设置时脚本会立即退出并报错。建议将凭证写入仅当前用户可读的文件（如 `~/.iceberg_env`），通过 `source` 加载，避免明文出现在 shell 历史或进程列表中。
+
 ### 卸载
 
 ```sql
