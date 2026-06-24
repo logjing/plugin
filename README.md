@@ -1,208 +1,345 @@
 # iceberg_delta
 
-openGauss 扩展插件，通过 FDW 机制实现 Iceberg 外表的 INSERT 截流和 Delta 内表自动管理，无需修改任何内核文件。
+openGauss 扩展插件，通过 FDW 机制实现 Iceberg 外表的 INSERT 截流与 Delta 内表缓冲，并提供将缓冲数据落湖（flush）到 Iceberg 数据湖的能力。
 
-## 功能概述
+---
 
-当用户向 Iceberg 外表执行 `INSERT` 时，数据并不写入远端 Iceberg 存储，而是被截流写入一张本地 Delta 内表（USTORE）。Delta 内表的创建、映射、级联删除全部由 DDL hook 自动完成，用户无需手动操作。
+## 一、设计思路
+
+### 核心问题
+
+直接把 Iceberg 当成可写的远端表来 `INSERT`，在数据库事务模型下代价极高：Iceberg 的每次写入都伴随 Parquet 文件落盘 + metadata snapshot 提交，属于"重"操作，与 openGauss 事务的轻量、行级、可回滚模型不匹配。
+
+### 本插件的方案
+
+不把数据直接写向 Iceberg，而是**用一张本地 USTORE 内表充当写缓冲区（delta 表）**：
+
+1. **写入快**：`INSERT` 截流，数据落入本地 USTORE delta 表，走标准 executor 数据流，开销与普通本地表写入相当，且天然支持事务回滚。
+2. **批量落湖**：用户在合适时机调用 `flush` 函数，把 delta 缓冲区里积攒的行一次性 Append 到 Iceberg（写 Parquet + 提交 snapshot），摊薄 Iceberg 的提交开销。
+3. **自动维护**：delta 内表的创建、映射、级联删除由 DDL hook 全自动完成，用户只面对外表，感知不到 delta 表的存在。
+
+一句话：**外表对用户是 Iceberg 表的入口，INSERT 实际写本地缓冲，flush 把缓冲搬运到湖。**
+
+---
+
+## 二、整体架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  用户 SQL 层                                                │
+│                                                            │
+│  CREATE FOREIGN TABLE t (...) SERVER iceberg_server ...    │
+│  INSERT INTO t VALUES (...)                                │
+│  SELECT * FROM iceberg_delta.iceberg_delta_flush('t');     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│  iceberg_delta 扩展（.so 动态库，shared_preload_libraries） │
+│                                                            │
+│  ① DDL Hook（注册 ProcessUtility_hook）                     │
+│       CREATE FT → 建 delta 表 + mapping + 依赖 + options 缓存│
+│       DROP FT   → 清 mapping（delta 表 DEPENDENCY_AUTO 级联删）│
+│                                                            │
+│  ② FDW handler（iceberg_fdw）                                │
+│       ExecForeignInsert → INSERT 截流，写入 delta 内表        │
+│       Scan 回调         → 读取 delta 内表                    │
+│                                                            │
+│  ③ 落湖函数 iceberg_delta_flush()                            │
+│       delta 行 → iceberg-lite → Append 到 S3 Iceberg → 清 delta│
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│  存储层                                                    │
+│                                                            │
+│  ┌────────────────────────┐   ┌───────────────────────────┐ │
+│  │ delta USTORE 内表        │   │ Iceberg 表（S3 / MinIO）  │ │
+│  │ iceberg_delta.<名>_delta│   │ Parquet + metadata snapshot│ │
+│  │ 写缓冲区（未落湖数据）    │   │ 已落湖数据                 │ │
+│  └────────────────────────┘   └───────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 模块文件
+
+| 文件 | 职责 |
+|------|------|
+| `iceberg_delta.cpp` | `_PG_init` 安装 `ProcessUtility_hook` |
+| `ddl_hook.cpp` | CREATE/DROP FOREIGN TABLE 拦截，建 delta 表 + 维护映射 |
+| `delta_table.cpp` | delta USTORE 内表的建表语句构造 |
+| `catalog.cpp` | `iceberg_delta.mapping` 映射表的增删改查 |
+| `fdw_handler.cpp` | FDW handler，注册 scan/modify 全部回调 |
+| `fdw_modify.cpp` | INSERT 截流、`IsForeignRelUpdatable`、delta_relid 缓存查找 |
+| `flush.cpp` | `iceberg_delta_flush` 落湖实现 + S3 配置解析 |
+| `fdw_options.cpp` | 外表选项校验器 |
+
+---
+
+## 三、功能详解
+
+### 3.1 创表（CREATE FOREIGN TABLE）
+
+外表一旦建好，DDL hook 会**自动**在 `iceberg_delta` schema 下创建一张结构相同的 USTORE 内表作为缓冲区，用户无需手动操作。
+
+#### 数据流
+
+```
+CREATE FOREIGN TABLE t (id int, name text, ...) SERVER iceberg_server OPTIONS (...)
+        │
+        ▼  DDL Hook 拦截 CreateForeignTableStmt（且 server == iceberg_server）
+        │
+   ① CallNextUtility()
+        │   先让 openGauss 正常建好外表 t，拿到 t 的 relid 与 tupdesc
+        │
+   ② IcebergDeltaTableCreate()
+        │   复制外表列结构，构造并执行：
+        │     CREATE TABLE iceberg_delta.t_delta (<同外表列>) WITH (STORAGE_TYPE = USTORE)
+        │
+   ③ recordDependencyOn(delta → 外表, DEPENDENCY_AUTO)
+        │   外表被 DROP 时，delta 表随之级联删除
+        │
+   ④ IcebergCatalogInsertDeltaTableMapping()
+        │   写入映射表：
+        │     iceberg_delta.mapping(foreign_relid, delta_relid, delta_schema, delta_name)
+        │
+   ⑤ IcebergDeltaUpdateForeignTableOptions()
+            SPI 执行：
+              ALTER FOREIGN TABLE t OPTIONS (
+                ADD delta_relid '<oid>', ADD delta_schema '...', ADD delta_name '...')
+            把 delta 表信息缓存进外表 options，后续 INSERT/flush 零 SPI 查询即可定位
+```
+
+#### delta 内表命名规则
+
+- schema 固定为 `iceberg_delta`
+- 表名 = `<外表名>_delta`（如外表 `t_sales` → `t_sales_delta`）
+- 外表名过长（含 `_delta` 后缀后超过 `NAMEDATALEN`）会直接报错：
+  ```
+  ERROR: foreign table name "..." is too long to generate delta table name (max N characters)
+  ```
+- 同名 delta 表已存在时报 `DUPLICATE_TABLE`（防止跨 schema 同名外表冲突）
+
+#### 选项（OPTIONS）
+
+| 类别 | 选项名 | 说明 |
+|------|--------|------|
+| 用户选项 | `location` | flush 落湖位置，**优先项**（见 3.3） |
+| | `warehouse` + `table_name` | location 的回退组合 |
+| | `foldername` | 其他用途选项（已放行） |
+| S3 选项 | `s3_endpoint`、`s3_access_key_id`、`s3_secret_access_key`、`s3_region`、`s3_path_style_access`、`s3_ssl_enabled` | 落湖/远端访问配置 |
+| 内部选项 | `delta_relid`、`delta_schema`、`delta_name` | **由 DDL hook 自动写入**，用户无需设置 |
+
+> 选项校验在 `fdw_options.cpp::iceberg_fdw_validator` 中完成，未识别的选项名会报 `FDW_INVALID_OPTION_NAME`。
+
+---
+
+### 3.2 插入（INSERT）
+
+`INSERT` 不触及远端 Iceberg，数据被 FDW 的 `ExecForeignInsert` 回调**截流**写入本地 delta USTORE 表。未 flush 前即可通过外表或直接查 delta 表读到。
+
+> **前置依赖**：INSERT 能进入 executor 的前提是 `iceberg_fdw` 在内核 FDW 白名单中，详见[第四节](#四内核改动说明必读)。
+
+#### 数据流
+
+```
+INSERT INTO t VALUES (...)
+        │
+        ▼  planner: PlanForeignModify
+        │   校验 commandType ∈ {INSERT}，解析 delta_relid，写入 fdw_private
+        ▼  BeginForeignModify
+        │   relation_open(delta 表, RowExclusiveLock)
+        │   构造 modify_state，存入 ri_FdwState
+        │
+        ▼  ExecForeignInsert(estate, rinfo, slot, planSlot)   ← 截流点
+        │   ① heap_slot_getallattrs(slot)
+        │        提取 slot 中全部属性值
+        │   ② tableam_tslot_get_tuple_from_slot(delta_rel, slot)
+        │        按外表列结构转为 USTORE 存储格式 tuple
+        │   ③ tableam_tuple_insert(delta_rel, tuple, es_output_cid, ...)
+        │        写入 delta 内表（非远端 Iceberg）
+        │
+        ▼  EndForeignModify
+            relation_close(delta 表)
+            返回 slot → 支持 RETURNING 子句
+```
+
+#### 关键点
+
+- **截流而非转发**：`ExecForeignInsert` 是天然截流点，数据只进本地 delta 表，不产生任何远端 Iceberg I/O。
+- **事务一致**：delta 写入在当前 PG 事务内，事务回滚则插入一并回滚。
+- **列结构对齐**：delta 表按外表列定义创建（见 3.1），列顺序与外表一致，转换时按位置对齐。
+
+---
+
+### 3.3 落湖（flush）
+
+将 delta 缓冲区中积攒的行批量写入远端 Iceberg 数据湖，成功后清空 delta 缓冲区。
+
+```
+SELECT iceberg_delta.iceberg_delta_flush('t');
+```
+
+返回值：本次刷写的行数（`int8`）。delta 为空时返回 `0`。
+
+#### 数据流
+
+```
+iceberg_delta_flush('t')
+        │
+        ▼ 1. 解析落湖位置
+        │   优先读外表 option location；
+        │   缺失则回退 warehouse + table_name（但本地非 s3:// 路径直接报错）
+        │   解析 s3://bucket/table_path → {bucket, table_path}
+        │
+        ▼ 2. 定位 delta 表
+        │   delta_relid 优先取外表 options 缓存（零 SPI）；
+        │   OID 失效则按 schema/name 查找；再回退到 mapping 表
+        │
+        ▼ 3. tableam 扫描 delta 表
+        │   逐行 Datum → iceberg_lite::Record，同时收集每行物理 ctid
+        │   若 nrows == 0 → 直接返回 0
+        │
+        ▼ 4. 懒创建 Iceberg 表
+        │   IcebergTable::Open(table_path)
+        │     成功 → 复用已有表
+        │     失败 → IcebergTable::Create（用 delta 的 schema 建表）
+        │   即首次 flush 才在 S3 上真正建表
+        │
+        ▼ 5. Append 到数据湖
+        │   iceberg_table.Append(records)  →  写 Parquet + 提交新 snapshot
+        │
+        ▼ 6. 清空 delta 缓冲区
+            DeleteDeltaRows(delta, ctids)  按物理位置删 delta 行 + CommandCounterIncrement
+            返回 nrows
+```
+
+#### S3 凭证解析优先级（三级，从高到低）
+
+| 优先级 | 来源 |
+|--------|------|
+| 1 | 外表 options（`s3_endpoint` / `s3_access_key_id` / ...） |
+| 2 | 环境变量（`ICEBERG_S3_ENDPOINT` / `ICEBERG_S3_ACCESS_KEY_ID` / ...） |
+| 3 | 编译期默认值（仅 `endpoint`/`region` 有默认） |
+
+> `access_key` 与 `secret_access_key` **无任何默认值**，三级均未提供时直接报错，避免敏感凭证进入源码与仓库。
+
+#### PG → Iceberg 类型映射
+
+| PG 类型 | Iceberg 类型 |
+|---------|--------------|
+| `bool` | Boolean |
+| `int2` / `int4` | Int |
+| `int8` | Long |
+| `float4` | Float |
+| `float8` | Double |
+| `date` / `time` | Date / Time |
+| `timestamp` / `timestamptz` | Timestamp / TimestampTz |
+| `bytea` | Binary |
+| `numeric` | Decimal |
+| 其他（含 `text`/`varchar`） | String |
+
+#### 示例（S3 / MinIO）
 
 ```sql
-CREATE EXTENSION iceberg_delta;
-
 CREATE FOREIGN TABLE t_sales (
-    id INTEGER,
-    name TEXT,
-    score FLOAT
-) SERVER iceberg_server OPTIONS (warehouse '/data/iceberg', table_name 'sales');
+    id   bigint,
+    name text,
+    score double precision
+) SERVER iceberg_server OPTIONS (
+    location              's3://mybucket/warehouse/t_sales',
+    s3_endpoint           'http://127.0.0.1:19000',
+    s3_access_key_id      'minioadmin',
+    s3_secret_access_key  'minioadmin',
+    s3_region             'us-east-1',
+    s3_path_style_access  'true',
+    s3_ssl_enabled        'false'
+);
 
--- INSERT 数据自动写入 Delta 内表，而非远端 Iceberg
-INSERT INTO t_sales VALUES (1, 'alice', 95.5);
+INSERT INTO t_sales VALUES (1, 'alice', 95.5), (2, 'bob', 88.0);
 
--- 通过 Delta 内表直接查询新写入的数据
-SELECT * FROM iceberg_delta.t_sales_delta;
-
--- 删除外表时 Delta 内表自动级联删除
-DROP FOREIGN TABLE t_sales;
+-- 落湖（返回刷写行数，此例为 2）
+SELECT iceberg_delta.iceberg_delta_flush('t_sales');
 ```
 
-**当前限制**：外表的 `SELECT` 查询走 placeholder scan 回调，代价极高且不返回有效数据。后续版本将实现两阶段合并扫描（lake + delta），使外表 `SELECT` 可看到完整数据。
+---
 
-## 实现路线
+## 四、内核改动说明（必读）
 
-原 pg_lake_delta 项目通过侵入式修改 openGauss 内核实现 INSERT 截流，涉及 8+ 个内核文件（新增系统 catalog、枚举类型、FDW 白名单扩展、nodeModifyTable.cpp 截流逻辑、execMain.cpp FDW 校验绕过等），导致无法跟随上游版本升级，运维成本高。
-
-本插件将所有功能以 openGauss 扩展形式实现，核心思路：
-
-| 原侵入方案 | 插件方案如何替代 |
-|---|---|
-| 新增 `pg_delta_table` 系统 catalog | 普通用户表 `iceberg_delta.mapping` |
-| 新增 `T_ICEBERG_SERVER` 枚举 | 不需要 — FDW handler 本身就是标识 |
-| 新增 `ICEBERG_FDW` 宏/常量 | 内核已有，直接沿用 |
-| `nodeModifyTable.cpp` 截流逻辑 | FDW `ExecForeignInsert` 回调天然就是截流点 |
-| `execMain.cpp` FDW 校验绕过 | 不需要 — FDW 提供了 `ExecForeignInsert` 回调，校验自然通过 |
-| `foreign.cpp` FDW 白名单扩展 | 不需要 — `iceberg_fdw` 已在白名单中 |
-
-**设计参考**：og_iceberg 项目已验证单 FDW 方案在 openGauss 上的可行性，本插件沿用了其 DDL hook、delta_relid 缓存等关键设计模式。
-
-## 整体架构
+本扩展的 `INSERT` 需要通过 openGauss 的 FDW 白名单校验，否则在 planner 阶段即被拒绝：
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                      用户 SQL 层                              │
-│                                                               │
-│  CREATE FOREIGN TABLE t_sales (...) SERVER iceberg_server;   │
-│    → DDL hook 自动创建 Delta 内表 + 映射 + 写入 options     │
-│  INSERT INTO t_sales VALUES (...);                            │
-│    → ExecForeignInsert 截流写入 Delta 内表                   │
-│  DROP FOREIGN TABLE t_sales;                                  │
-│    → 映射清理 + DEPENDENCY_AUTO 级联删除 Delta 内表          │
-└───────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌───────────────────────────────────────────────────────────────┐
-│           openGauss 内核（白名单已有 iceberg_fdw）            │
-│                                                               │
-│  CheckSupportedFDWType: "iceberg_fdw" 在白名单中 ✓           │
-│  InitPlan: ExecForeignInsert != NULL ✓                        │
-│  ExecInsertT: ri_FdwRoutine → 调用 iceberg_fdw 回调          │
-└───────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌───────────────────────────────────────────────────────────────┐
-│            iceberg_delta 插件（.so 动态库）                   │
-│                                                               │
-│  _PG_init(): 安装 ProcessUtility_hook                        │
-│                                                               │
-│  DDL Hook:                                                   │
-│    ├─ CREATE FOREIGN TABLE → 自动创建 Delta 内表              │
-│    │   + 映射记录 + DEPENDENCY_AUTO + delta_relid 写入 opts  │
-│    └─ DROP FOREIGN TABLE → 清理映射记录                       │
-│      (Delta 内表通过 DEPENDENCY_AUTO 级联删除)               │
-│                                                               │
-│  iceberg_fdw_handler() → 返回 FdwRoutine                     │
-│    ├─ Insert 回调: Plan → Begin → Exec → EndForeignModify    │
-│    ├─ IsForeignRelUpdatable: 支持 INSERT                     │
-│    └─ Scan 回调: placeholder（后续版本实现）                  │
-│                                                               │
-│  映射表: iceberg_delta.mapping                               │
-│    (foreign_relid, delta_relid, delta_schema, delta_name)    │
-│  外表 options 缓存: delta_relid, delta_schema, delta_name    │
-└───────────────────────────────────────────────────────────────┘
+ERROR:  Un-support feature
+DETAIL: insert statement is an INSERT INTO VALUES(...)
 ```
 
-### INSERT 截流流程
+因此需要**两处内核修改**（详见 [`BUILD_AND_DEBUG.md`](./BUILD_AND_DEBUG.md)「问题 5」）：
 
-```
-INSERT INTO t_sales VALUES (1, 'alice', 95.5)
-  → ExecInsertT() 检测到 ri_FdwRoutine 非空
-  → 调用 ExecForeignInsert(estate, rinfo, slot, planSlot)
-  → 插件回调中:
-      1. heap_slot_getallattrs(slot)  — 提取所有属性值
-      2. tableam_tslot_get_tuple_from_slot() — 转换为存储格式 tuple
-      3. tableam_tuple_insert(delta_rel, tuple) — 写入 Delta 内表
-  → 返回 slot（支持 RETURNING 子句）
-```
+| 文件 | 改动 |
+|------|------|
+| `src/include/postgres.h` | 新增宏 `#define ICEBERG_FDW "iceberg_fdw"`（置于 `MOT_FDW_SERVER` 之后、`DFS_FDW` 之前） |
+| `src/gausskernel/cbb/extension/foreign/foreign.cpp` | `supportFDWType[]` 数组末尾追加 `ICEBERG_FDW` |
 
-### delta_relid 查找策略
-
-优先用外表 options 中的 OID 缓存（零 SPI 查询），OID 失效时 fallback 到按 schema/name 查找（保证 dump/restore 后可用），并自动更新映射表中的 OID 缓存。
-
-## 编译方法
-
-### 前置条件
-
-- openGauss 已编译（源码树或安装目录中有 `pg_config`）
-- binarylibs 工具链（GCC 10.3）
-
-### 编译
+修改后需重新编译 openGauss 内核：
 
 ```bash
-# 设置 PATH，优先使用 binarylibs 的 GCC 10.3 和 openGauss 的 pg_config
-export PATH=/path/to/binarylibs/buildtools/gcc10.3/gcc/bin:/path/to/openGauss_install/bin:$PATH
-export LD_LIBRARY_PATH=/path/to/binarylibs/buildtools/gcc10.3/gcc/lib64:$LD_LIBRARY_PATH
-
-# 编译
-cd iceberg_delta
-make
+cd ~/openGauss-server
+./build.sh -m release -3rd ~/binarylibs
 ```
 
-如果 openGauss 的 `pg_config` 返回的安装路径不存在（常见于 pg_lake_delta 等二次构建场景），需要创建符号链接：
+> 内核重编会清空插件 `.so`，需随后重新 `make install` 并重建 `proc_srclib` 符号链接。
+
+---
+
+## 五、数据可见性与边界
+
+| 时机 | 外表 `SELECT` 能看到的数据 |
+|------|---------------------------|
+| INSERT 后、flush 前 | ✅ **能看到**（scan 回调读取 delta 内表） |
+| flush 后 | ❌ **看不到**（delta 已清空，外表 scan 不读 Iceberg 已落湖数据） |
+
+> **重要**：当前外表 `SELECT` 只读取 delta 缓冲区（未落湖数据），不合并读取已落湖的 Iceberg 数据。因此 flush 后这些行从外表查询中"消失"是预期行为，并非数据丢失——它们已安全落湖。两阶段合并读取（lake + delta）属后续路线。
+
+其他边界：
+
+- **flush 仅支持 S3 / MinIO**：本地 `warehouse`（非 `s3://`）路径在 flush 时直接报错，不支持本地文件系统。
+- **DELETE 尚未在文档范围**：本 README 聚焦创表/插入/flush 三项功能。
+
+---
+
+## 六、编译与部署
+
+> 完整流程与排障见 [`BUILD_AND_DEBUG.md`](./BUILD_AND_DEBUG.md)，此处仅列要点。
 
 ```bash
-# 例如 pg_config 返回 /path/to/openGauss-server/mppdb_temp_install
-# 但实际文件在 /path/to/pg_lake_delta/mppdb_temp_install
-ln -sf /path/to/pg_lake_delta/mppdb_temp_install /path/to/openGauss-server/mppdb_temp_install
+# 1. 编译插件（须先用 binarylibs GCC 10.3，依赖 iceberg-lite）
+cd ~/plugin
+make clean && make && make install
+
+# 2. 安装 NOT FENCED 函数库
+mkdir -p $GAUSSHOME/lib/postgresql/proc_srclib
+ln -sf $GAUSSHOME/lib/postgresql/iceberg_delta.so \
+       $GAUSSHOME/lib/postgresql/proc_srclib/iceberg_delta
+
+# 3. 配置并重启
+#    postgresql.conf:  shared_preload_libraries = 'iceberg_delta'
+gs_ctl restart -D ~/ogdata -Z single_node
+
+# 4. 安装扩展
+gsql -d postgres -p 9876 -c "CREATE EXTENSION iceberg_delta;"
 ```
 
-如果 openGauss 安装目录的头文件不完整（缺少 `access/htap/` 等子目录），需要在 Makefile 中添加源码树的 `src/include` 路径。当前 Makefile 已包含此配置：
-
-```makefile
-override CPPFLAGS += -I/home/sin/pg_lake_delta/src/include
-```
-
-使用其他环境时需将此路径改为对应的 openGauss 源码头文件目录。
-
-### 安装
+端到端验证：
 
 ```bash
-make install
+ICEBERG_S3_ACCESS_KEY_ID=... ICEBERG_S3_SECRET_ACCESS_KEY=... \
+bash test_flush_e2e.sh
 ```
 
-### 部署
+---
 
-```bash
-# 1. 在 postgresql.conf 中配置 shared_preload_libraries
-#    DDL hook 必须在 postmaster 启动时全局安装
-shared_preload_libraries = 'iceberg_delta'
+## 七、文档索引
 
-# 2. 重启 openGauss
-gs_ctl restart -D /path/to/datadir
-
-# 3. 在目标数据库中安装扩展
-gsql -d postgres -c "CREATE EXTENSION iceberg_delta;"
-```
-
-### 环境变量配置
-
-`iceberg_delta_flush` 在向 MinIO/S3 数据湖写数据时需要 S3 凭证。凭证来源优先级为（从高到低）：
-
-1. **外表 options**（`CREATE FOREIGN TABLE ... OPTIONS (s3_endpoint '...', s3_access_key_id '...', s3_secret_access_key '...', s3_region '...')`）——优先级最高，单表覆盖。
-2. **环境变量**——外表未指定 option 时的兜底来源。
-3. **编译期默认值**——仅 `endpoint`（`http://127.0.0.1:19000`）和 `region`（`us-east-1`）有非敏感默认值。
-
-为避免敏感凭证进入源码与仓库，**access key 与 secret access key 不再有硬编码默认值**；若外表 option 与环境变量均未提供，flush 将报错并提示缺失项。
-
-在运行 openGauss 的环境（启动 `gs_ctl` 的 shell，或 systemd unit 的 `Environment=`）中设置以下环境变量：
-
-| 环境变量 | 说明 | 默认值 |
-|---|---|---|
-| `ICEBERG_S3_ENDPOINT` | MinIO/S3 端点 URL | `http://127.0.0.1:19000` |
-| `ICEBERG_S3_ACCESS_KEY_ID` | 访问密钥 ID | **无（必填）** |
-| `ICEBERG_S3_SECRET_ACCESS_KEY` | 访问密钥 | **无（必填）** |
-| `ICEBERG_S3_REGION` | region | `us-east-1` |
-
-```bash
-# 在启动 openGauss 的 shell 中设置（gs_ctl 继承这些变量）
-export ICEBERG_S3_ENDPOINT="http://172.168.22.25:19000"
-export ICEBERG_S3_ACCESS_KEY_ID="your-access-key"
-export ICEBERG_S3_SECRET_ACCESS_KEY="your-secret-key"
-export ICEBERG_S3_REGION="us-east-1"
-export ICEBERG_S3_BUCKET="your-bucket"
-
-gs_ctl restart -D /path/to/datadir
-```
-
-> 端到端测试脚本 `test_flush_e2e.sh` 同样读取上述环境变量（其中 `ICEBERG_S3_BUCKET` 用于指定 bucket）。access key / secret 未设置时脚本会立即退出并报错。建议将凭证写入仅当前用户可读的文件（如 `~/.iceberg_env`），通过 `source` 加载，避免明文出现在 shell 历史或进程列表中。
-
-### 卸载
-
-```sql
--- 先删除所有使用 iceberg_server 的外表
--- Delta 内表随外表级联删除（DEPENDENCY_AUTO）
-
-DROP EXTENSION iceberg_delta CASCADE;
--- 自动删除：schema、映射表、FDW、server
-
--- 从 postgresql.conf 中移除 shared_preload_libraries
--- 重启 openGauss
-```
+| 文档 | 说明 |
+|------|------|
+| [`BUILD_AND_DEBUG.md`](./BUILD_AND_DEBUG.md) | 编译流程、内核改动、排障记录、功能验证 |
+| [`iceberg_delta--1.0.sql`](./iceberg_delta--1.0.sql) | 扩展安装脚本（mapping 表、FDW、server、flush 函数） |
+| [`test_flush_e2e.sh`](./test_flush_e2e.sh) | flush 端到端测试（建表→插入→落湖→MinIO 校验） |
