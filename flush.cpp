@@ -556,3 +556,95 @@ Datum iceberg_delta_flush(PG_FUNCTION_ARGS)
 
     PG_RETURN_INT64(total_flushed);
 }
+
+/* ════════════════════════════════════════════════════════════════════
+ * IcebergDeltaDeleteFromLake — 删除 Iceberg 数据湖中匹配的行
+ *
+ * 从 EndForeignModify 调用，处理 DELETE FROM <外表> 的落湖侧删除。
+ * filter 是 PyIceberg 可解析的 SQL 表达式（如 "id == 1"）。
+ * 异常通过 ereport 报告，调用者位于 PG 事务中。
+ * ════════════════════════════════════════════════════════════════════ */
+
+void IcebergDeltaDeleteFromLake(Oid foreign_relid, const char* filter)
+{
+    if (filter == NULL || filter[0] == '\0') {
+        /* empty filter = delete all rows from Iceberg */
+    }
+
+    Relation foreign_rel = NULL;
+    MemoryContext oldctx;
+    MemoryContext delete_ctx = AllocSetContextCreate(CurrentMemoryContext,
+                                                      "iceberg_delta delete context",
+                                                      ALLOCSET_DEFAULT_MINSIZE,
+                                                      ALLOCSET_DEFAULT_INITSIZE,
+                                                      ALLOCSET_DEFAULT_MAXSIZE);
+
+    PG_TRY();
+    {
+        oldctx = MemoryContextSwitchTo(delete_ctx);
+
+        /* ── 1. 打开外表，提取 S3 选项 ── */
+        foreign_rel = relation_open(foreign_relid, AccessShareLock);
+        ForeignTable* ft = GetForeignTable(foreign_relid);
+
+        const char* location = GetOptionString(ft->options, ICEBERG_OPT_LOCATION);
+        if (location == NULL) {
+            const char* warehouse = GetOptionString(ft->options, ICEBERG_OPT_WAREHOUSE);
+            const char* table_name = GetOptionString(ft->options, ICEBERG_OPT_TABLE_NAME);
+            if (warehouse == NULL || table_name == NULL) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                         errmsg("iceberg_delta DELETE requires 'location' option "
+                                "or 'warehouse' + 'table_name' options")));
+            }
+            StringInfoData locbuf;
+            initStringInfo(&locbuf);
+            appendStringInfo(&locbuf, "%s/%s", warehouse, table_name);
+            location = locbuf.data;
+        }
+
+        std::string bucket, table_path;
+        if (!ParseS3Location(location, bucket, table_path) || bucket.empty()) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("invalid iceberg_delta location: \"%s\"; "
+                            "expected s3://bucket/table_path format", location)));
+        }
+
+        /* ── 2. 连接 S3，打开 Iceberg 表 ── */
+        iceberg_lite::S3Config s3_conf = BuildS3Config(ft->options, bucket);
+        iceberg_lite::S3Client s3_client(s3_conf);
+
+        try {
+            iceberg_lite::IcebergTable iceberg_table =
+                iceberg_lite::IcebergTable::Open(s3_client, table_path);
+
+            /* ── 3. 删除匹配行 ── */
+            if (filter != NULL && filter[0] != '\0') {
+                iceberg_table.Delete(std::string(filter));
+            } else {
+                /* empty filter = delete all */
+                iceberg_table.Delete(std::string("True"));
+            }
+        } catch (const std::exception& e) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_ERROR),
+                     errmsg("failed to delete from iceberg table: %s",
+                            e.what())));
+        }
+
+        MemoryContextSwitchTo(oldctx);
+    }
+    PG_CATCH();
+    {
+        if (foreign_rel != NULL)
+            relation_close(foreign_rel, AccessShareLock);
+        MemoryContextDelete(delete_ctx);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (foreign_rel != NULL)
+        relation_close(foreign_rel, AccessShareLock);
+    MemoryContextDelete(delete_ctx);
+}

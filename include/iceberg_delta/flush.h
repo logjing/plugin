@@ -20,6 +20,17 @@ extern "C" {
  * transaction rolls back, restoring the delta rows. */
 extern Datum iceberg_delta_flush(PG_FUNCTION_ARGS);
 
+/* Delete matching rows from the Iceberg data lake.
+ *
+ * Called from EndForeignModify when processing DELETE FROM <foreign table>.
+ * filter is a PyIceberg-compatible SQL expression string (e.g. "id == 1").
+ * The function opens the foreign table to extract S3 options, connects to
+ * MinIO/S3, and calls IcebergTable::Delete(filter).
+ *
+ * This function is not a PG function — it is called internally from the
+ * FDW modify path. Errors are raised via ereport. */
+extern void IcebergDeltaDeleteFromLake(Oid foreign_relid, const char* filter);
+
 #ifdef __cplusplus
 }
 #endif
