@@ -431,6 +431,200 @@ SELECT iceberg_delta.iceberg_delta_flush('t_sales');
 
 ---
 
+### 3.4 删除（DELETE）
+
+> **本节内容仅在 `delete` 分支实现**，其余分支不含 DELETE 能力。
+
+外表的 `DELETE FROM <外表> WHERE <条件>` 执行**双删**：同时删除**未 flush 的 delta 缓冲行**和**已 flush 进 Iceberg 数据湖的行**。用户面对外表写一条 DELETE 即可，两侧删除由 FDW 回调协作完成。
+
+#### 设计思路：为什么需要双删
+
+一份数据可能存在于两个位置：
+
+- **delta 内表**：INSERT 后、flush 前，行落在本地缓冲区。
+- **Iceberg 湖表**：flush 之后，行已落湖（Parquet + snapshot）。
+
+如果 DELETE 只删一侧，就会漏删另一侧，导致数据"删不干净"。因此 DELETE 必须两边都处理。两侧的删除标识互相独立——
+
+- delta 侧按行的**物理 ctid** 删（不需要主键）；
+- Iceberg 侧用原 **WHERE 条件重建的 filter 字符串**下发删除（也不依赖主键）。
+
+因此本实现**不强制外表定义 PRIMARY KEY**。
+
+#### 设计思路：标准 FDW 逐行模型
+
+DELETE 必须先"扫到要删的行"，再逐行调 `ExecForeignDelete`。这要求外表的 scan 从 placeholder 升级为**真实 delta 扫描**（读取 delta 内表行 + 暴露 ctid 作为 junk 列）。这正是与 INSERT 截流不同的地方——DELETE 复用了 delta scan 能力。
+
+#### 数据流
+
+```
+DELETE FROM 外表 WHERE <条件>
+        │
+        ▼  planner: PlanForeignModify
+        │   放开 CMD_DELETE；校验 WHERE 是否在支持范围内
+        │   遍历 WHERE 的 Expr 树，重建为 PyIceberg filter 字符串（如 "id == 1 AND name == 'a'"）
+        │   把 delta_relid + filter 字符串塞进 fdw_private
+        │
+        ▼  AddForeignUpdateTargets
+        │   给外表 scan 注入一个 resjunk 列 "ctid"（行物理位置）
+        │
+        ▼  BeginForeignScan / IterateForeignScan   ← scan 已升级为真扫描
+        │   逐行读 delta 内表，把每行的物理 ctid 填进 junk 列
+        │
+        ▼  ExecForeignDelete(逐行)                  ← 先删 delta
+        │   从 planSlot 的 junk 列取出该行 ctid
+        │   tableam_tuple_delete(delta_rel, ctid)  删本地缓冲行
+        │
+        ▼  EndForeignModify                         ← 后删 Iceberg
+            IcebergDeltaDeleteFromLake(外表, filter)
+            iceberg_table.Delete(filter)  批量删已落湖数据 + 提交新 snapshot
+```
+
+#### 删除时序：先删 delta，后删 Iceberg
+
+这是刻意安排的顺序，保证失败时数据一致：
+
+- **delta 删除是本地事务**，回滚成本低；
+- **Iceberg delete 涉及 S3 写 + snapshot 提交**，代价高。
+
+若先删 Iceberg 成功、删 delta 失败 → delta 残留行下次 flush 会重新写回 Iceberg，等于"删了又回来"。反之先删 delta，若失败整体回滚，Iceberg 尚未动。
+
+#### 代码片段：WHERE → filter 字符串转换
+
+转换器遍历 openGauss 的 `Expr` 树，把比较/逻辑/字面量重建为 PyIceberg 可解析的字符串。超出支持范围一律 `ereport(ERROR)`：
+
+```cpp
+// fdw_modify.cpp —— WHERE Expr 树 → filter 字符串的递归核心
+static void AppendFilterExpr(StringInfo buf, Node* node, PlannerInfo* root,
+                              int targetRti, bool* hasError) {
+    switch (nodeTag(node)) {
+        case T_OpExpr:        // 比较表达式：a = 1
+            AppendFilterOpExpr(buf, (OpExpr*)node, root, targetRti, hasError);
+            break;
+        case T_BoolExpr: {    // 逻辑组合：a AND b / a OR b
+            BoolExpr* bexpr = (BoolExpr*)node;
+            const char* joiner = (bexpr->boolop == OR_EXPR) ? " OR " : " AND ";
+            // ... 拼接各子条件
+            break;
+        }
+        case T_Var: {         // 列引用：必须是目标外表的列，否则报错
+            Var* var = (Var*)node;
+            if ((int)var->varno != targetRti) { *hasError = true; return; }
+            // ... 输出列名
+            break;
+        }
+        case T_Const:         // 字面量：1 / 'abc' / 1.5
+            AppendFilterConst(buf, (Const*)node);
+            break;
+        default:              // 不支持的节点类型（IN/LIKE/子查询等）
+            *hasError = true;
+            break;
+    }
+}
+```
+
+比较运算符在转换时映射成 PyIceberg 的语法（PG 的 `=` → PyIceberg 的 `==`）：
+
+```cpp
+// fdw_modify.cpp —— PG 运算符 → PyIceberg 表达式语法
+if (strcmp(opname, "=") == 0)      appendStringInfoString(buf, " == ");   // 注意：== 而非 =
+else if (strcmp(opname, "<>") == 0) appendStringInfoString(buf, " != ");
+else if (strcmp(opname, "<") == 0)  appendStringInfoString(buf, " < ");
+// ... <=, >, >= 同理
+else { *hasError = true; return; }   // 未知运算符：报"暂不支持"
+```
+
+转换失败时给用户清晰的报错（支持范围见下文）：
+
+```cpp
+// fdw_modify.cpp —— 不支持的 WHERE 直接 ERROR
+if (hasError) {
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("iceberg_fdw DELETE: unsupported WHERE expression"),
+             errdetail("Only =, <>, <, <=, >, >=, AND, OR, and simple "
+                       "literals are supported in DELETE WHERE clauses")));
+}
+```
+
+#### 代码片段：注入 ctid junk 列
+
+DELETE 走标准 FDW 逐行模型，需要把 delta 行的物理 ctid 作为 junk 列暴露给 executor，这样 `ExecForeignDelete` 才能拿到"删哪一行"：
+
+```cpp
+// fdw_modify.cpp —— 给 DELETE 计划注入 ctid junk 列
+void IcebergDeltaAddForeignUpdateTargets(Query* parsetree, RangeTblEntry* target_rte,
+                                          Relation target_relation) {
+    // SelfItemPointerAttributeNumber = 外表自身的 ctid 列号（与 postgres_fdw 一致）
+    Var* var = makeVar((Index)linitial_int(parsetree->resultRelations),
+                       SelfItemPointerAttributeNumber, TIDOID, -1, InvalidOid, 0);
+    // resjunk=true：该列不对外可见，仅 executor 内部用于定位删除目标
+    TargetEntry* tle = makeTargetEntry((Expr*)var,
+        list_length(parsetree->targetList) + 1, pstrdup("ctid"), true);
+    parsetree->targetList = lappend(parsetree->targetList, tle);
+}
+```
+
+#### 代码片段：逐行删 delta
+
+每扫到一行，executor 就调一次 `ExecForeignDelete`，从 planSlot 取出该行 ctid 删本地缓冲行——这一步**不碰 Iceberg**：
+
+```cpp
+// fdw_modify.cpp —— DELETE 的逐行删除（delta 侧）
+TupleTableSlot* IcebergDeltaExecForeignDelete(EState* estate, ResultRelInfo* rinfo,
+                                               TupleTableSlot* slot, TupleTableSlot* planSlot) {
+    IcebergDeltaFdwModifyState* st = (IcebergDeltaFdwModifyState*)rinfo->ri_FdwState;
+
+    // 从 junk 列取出当前行的 ctid（由 AddForeignUpdateTargets 注入、由 scan 填充）
+    Datum ctid_datum = ExecGetJunkAttribute(planSlot, st->ctid_attno, &isNull);
+    ItemPointer ctid = (ItemPointer)DatumGetPointer(ctid_datum);
+
+    // 按物理位置删本地 delta 行（非远端 Iceberg）
+    TM_FailureData tmfd;
+    TM_Result result = tableam_tuple_delete(st->delta_rel, ctid,
+                                             GetCurrentCommandId(false),
+                                             InvalidSnapshot, GetActiveSnapshot(),
+                                             true, NULL, &tmfd, false);
+    return slot;
+}
+```
+
+> 注意 `IsForeignRelUpdatable` 在 3.2 已含 `CMD_DELETE` 位（`return (1<<CMD_INSERT) | (1<<CMD_DELETE)`），这是 DELETE 能进入 executor 的前提。
+
+#### 代码片段：批量删 Iceberg（落湖侧）
+
+所有行处理完后，`EndForeignModify` 拿出之前在 `PlanForeignModify` 重建好的 filter 字符串，对数据湖批量执行一次删除。空 filter 表示全删：
+
+```cpp
+// flush.cpp —— 删除 Iceberg 数据湖中匹配的行
+void IcebergDeltaDeleteFromLake(Oid foreign_relid, const char* filter) {
+    // ... 解析 S3 位置、打开 Iceberg 表 ...
+    iceberg_lite::IcebergTable iceberg_table =
+        iceberg_lite::IcebergTable::Open(s3_client, table_path);
+
+    if (filter != NULL && filter[0] != '\0') {
+        iceberg_table.Delete(std::string(filter));   // 有 WHERE：按 filter 删
+    } else {
+        iceberg_table.Delete(std::string("True"));    // 空 WHERE：等价于删全表
+    }
+}
+```
+
+#### WHERE 支持范围
+
+| 支持 | 不支持（报 `FEATURE_NOT_SUPPORTED`） |
+|------|------|
+| 比较运算符 `=, <>, <, <=, >, >=` | `IN`、`LIKE`、`BETWEEN` |
+| 逻辑组合 `AND`、`OR` | 函数调用、子查询 |
+| 字面量：整数/浮点/字符串 | 跨表 JOIN 条件（`DELETE FROM a USING b ...`） |
+
+#### 失败处理
+
+- **delta 删除失败** → 整语句 ERROR，Iceberg 未动，事务回滚。安全。
+- **Iceberg delete 失败** → delta 已删但处于未提交事务内，整语句 ERROR 触发回滚，delta 行恢复。安全。极端情况下若 Iceberg 已部分提交 snapshot 再抛异常，可能产生"delta 已回滚但 Iceberg 已删"的短暂窗口——本版本接受此风险，后续可通过两阶段（先收集待删主键、验证后再删）加固。
+
+---
+
 ## 四、内核改动说明（必读）
 
 本扩展的 `INSERT` 需要通过 openGauss 的 FDW 白名单校验，否则在 planner 阶段即被拒绝：
@@ -470,7 +664,7 @@ cd ~/openGauss-server
 其他边界：
 
 - **flush 仅支持 S3 / MinIO**：本地 `warehouse`（非 `s3://`）路径在 flush 时直接报错，不支持本地文件系统。
-- **DELETE 尚未在文档范围**：本 README 聚焦创表/插入/flush 三项功能。
+- **DELETE 仅在 `delete` 分支**：DELETE 功能（双删、WHERE 范围）见 [3.4](#34-删除delete)，主分支默认不含。
 
 ---
 
