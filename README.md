@@ -802,3 +802,5 @@ bash test_flush_e2e.sh
 | [`BUILD_AND_DEBUG.md`](./BUILD_AND_DEBUG.md) | 编译流程、内核改动、排障记录、功能验证 |
 | [`iceberg_delta--1.0.sql`](./iceberg_delta--1.0.sql) | 扩展安装脚本（mapping 表、FDW、server、flush 函数） |
 | [`test_flush_e2e.sh`](./test_flush_e2e.sh) | flush 端到端测试（建表→插入→落湖→MinIO 校验） |
+| [`test_delete_float_precision.sh`](./test_delete_float_precision.sh) | DELETE 浮点精度漏删测试 |
+| [`docs/type_conversion_test_report.md`](./docs/type_conversion_test_report.md) | DELETE 类型转换端到端测试报告（浮点 + 整数边界） |
