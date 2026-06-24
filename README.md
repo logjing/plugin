@@ -623,6 +623,102 @@ void IcebergDeltaDeleteFromLake(Oid foreign_relid, const char* filter) {
 - **delta 删除失败** → 整语句 ERROR，Iceberg 未动，事务回滚。安全。
 - **Iceberg delete 失败** → delta 已删但处于未提交事务内，整语句 ERROR 触发回滚，delta 行恢复。安全。极端情况下若 Iceberg 已部分提交 snapshot 再抛异常，可能产生"delta 已回滚但 Iceberg 已删"的短暂窗口——本版本接受此风险，后续可通过两阶段（先收集待删主键、验证后再删）加固。
 
+#### 已知问题：浮点 filter 精度漏删与类型转换改进计划
+
+##### 问题
+
+当前 `AppendFilterConst`（`fdw_modify.cpp:76`）按 **PG 字面量类型**序列化 WHERE 条件中的常量值，不感知 Iceberg 列的实际存储类型。当列是 `REAL`（float4/单精度）时，`%f` 默认仅 6 位小数，加上 planner 会将字面量提升精度（如 `0.1` 被编码为 float8 const），导致 filter 值与 Iceberg 列中实际存储的单精度值不匹配 → 漏删。
+
+实测验证（`test_delete_float_precision.sh`）：
+
+```
+flush 写入 Iceberg 的值: 0.10000000149011612  (float4 精确)
+DELETE WHERE 序列化:      "0.100000"           (%f, 仅 6 位)
+PyIceberg 解析:          0.1                   (与之不等)
+结果: 漏删 — id=1 未被删除
+```
+
+##### 改进计划：PG → Iceberg 类型映射转换器
+
+**核心思路**：字面量按 Iceberg 列的目标类型（而非 PG 字面量自身的类型）来序列化，并对数值做精度降级（如 double → float），确保 filter 中的值与 Iceberg 表里实际存储的值精确匹配。
+
+**Step 1 — 定义 PG → Iceberg 类型映射**
+
+在 `fdw_modify.cpp` 中新增枚举和映射函数（与 `flush.cpp::PgTypeToIcebergTypeKind` 一致但不依赖 iceberg-lite 头文件）：
+
+```c
+typedef enum { ICB_BOOLEAN, ICB_INT, ICB_LONG, ICB_FLOAT, ICB_DOUBLE,
+               ICB_STRING, ICB_DATE, ICB_TIME, ICB_TIMESTAMP,
+               ICB_TIMESTAMPTZ, ICB_BINARY, ICB_DECIMAL } IcebergType;
+
+PgTypeToIcebergType(pg_type) → IcebergType
+    // INT2/INT4 → ICB_INT, INT8 → ICB_LONG
+    // FLOAT4 → ICB_FLOAT, FLOAT8 → ICB_DOUBLE
+    // BOOL → ICB_BOOLEAN, TEXTOID/VARCHAR/... → ICB_STRING
+    // DATE/TIME/TIMESTAMP/... → 对应时态类型
+    // BYTEA → ICB_BINARY, NUMERIC → ICB_DECIMAL
+```
+
+**Step 2 — 修改 `AppendFilterExpr` 签名，增加列类型参数**
+
+```
+原: AppendFilterExpr(buf, node, root, targetRti, hasError)
+新: AppendFilterExpr(buf, node, root, targetRti, hasError, column_pg_type)
+    // column_pg_type: 当序列化为 "col OP const" 中 const 一侧时传入列 PG 类型
+    //                 其他情况传 InvalidOid（无列上下文）
+```
+
+**Step 3 — 修改 `AppendFilterOpExpr`，识别 `col OP const` 模式**
+
+在比较运算符处理中增加：
+1. 检查 `left/right` 一侧为 `T_Var`、另一侧为 `T_Const`
+2. 若是 → 通过 `get_atttype(rte->relid, var->varattno)` 获取列的 PG 类型
+3. 序列化 Var 侧时传 `InvalidOid`（列引用不需要列类型），Const 侧时传列的 PG 类型
+
+**Step 4 — 重写 `AppendFilterConst`，按 Iceberg 类型 + 精度降级序列化**
+
+```
+AppendFilterConst(buf, con, column_pg_type):
+    1. NULL → "None"
+    2. 有效 PG 类型 = column_pg_type ?? con->consttype  (列类型优先)
+    3. Iceberg 类型 = PgTypeToIcebergType(有效 PG 类型)
+    4. 按 Iceberg 类型分支:
+```
+
+| Iceberg 类型 | 序列化格式 | 精度降级 |
+|---|---|---|
+| `ICB_BOOLEAN` | `True` / `False` | — |
+| `ICB_INT` (32-bit) | `%d` | float8→int4 降级 |
+| `ICB_LONG` (64-bit) | `%ld` | 同上 |
+| `ICB_FLOAT` (32-bit) | **`%.17g`** | **const 是 float8 时 `(float)DatumGetFloat8` 降至 float4** |
+| `ICB_DOUBLE` (64-bit) | **`%.17g`** | float4→double 提升 |
+| `ICB_STRING` | `'xxx'`（引号+单引号双写转义） | OidOutputFunctionCall |
+| `ICB_DATE/TIME/TS/DECIMAL/BINARY` | 引号包围 PG output | OidOutputFunctionCall |
+
+**精度降级核心逻辑**（解决浮点漏删的关键）：
+
+```c
+/* 列是 float4，但 planner 把 const 编码为 float8 */
+case ICB_FLOAT: {
+    float fval;
+    if (con->consttype == FLOAT8OID && column_pg_type == FLOAT4OID)
+        fval = (float)DatumGetFloat8(con->constvalue);  // double → float demotion
+    else if (con->consttype == FLOAT4OID)
+        fval = DatumGetFloat4(con->constvalue);
+    // ...
+    appendStringInfo(buf, "%.17g", (double)fval);   // 17 位保证 float4 往返不丢精度
+}
+```
+
+**效果**：`DELETE WHERE score = 0.1`（列 float4，const float8）
+- 降级: `(float)0.1` → `0.10000000149011612`
+- 序列化: `%.17g` → `"0.10000000149011612"`
+- PyIceberg 解析 → `0.10000000149011612`，与 Iceberg Float 列值精确匹配 → **不漏删**
+
+**修改范围**：仅 `fdw_modify.cpp` 一个文件，不改任何头文件或 API。
+
+**验证方式**：`test_delete_float_precision.sh`——建 float4 外表 → INSERT 0.1 → flush → DELETE WHERE score = 0.1 → pyiceberg 校验 id=1 是否被正确删除。
+
 ---
 
 ## 四、内核改动说明（必读）
