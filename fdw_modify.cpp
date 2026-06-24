@@ -66,39 +66,176 @@ int IcebergDeltaIsForeignRelUpdatable(Relation rel)
  * WHERE Expr → PyIceberg filter 字符串转换器
  *
  * 遍历 openGauss 的 Expr 树，重建为 PyIceberg 可解析的 SQL 过滤字符串。
+ *
+ * 类型转换策略
+ * ────────────
+ * 字面量按 Iceberg 列的目标类型（而非外表 PG 类型）序列化，确保 filter
+ * 值与 Iceberg 表里实际存储的值精确匹配。
+ *
+ * PG → Iceberg 类型映射与 flush.cpp::PgTypeToIcebergTypeKind 一致。
+ * 序列化时额外做"列类型精度降级"：若 const 在 planner 阶段被提升为更高
+ * 精度类型（如 float4 列 + 0.1 → const 被编码为 float8），先将 Datum
+ * 转换到列精度再序列化，杜绝浮点漏删。
+ *
  * 第一版支持：=, <>, <, <=, >, >=, AND/OR, 字面量。
  * 不支持：IN, LIKE, BETWEEN, 函数, 子查询, IS NULL（后续版本）。
  * ════════════════════════════════════════════════════════════════════ */
 
-static void AppendFilterExpr(StringInfo buf, Node* node, PlannerInfo* root,
-                              int targetRti, bool* hasError);
+/* ──── PG → Iceberg 类型映射 ──── */
 
-static void AppendFilterConst(StringInfo buf, Const* con)
+typedef enum IcebergType {
+    ICB_BOOLEAN,
+    ICB_INT,          /* 32-bit */
+    ICB_LONG,         /* 64-bit */
+    ICB_FLOAT,        /* 32-bit IEEE 754 */
+    ICB_DOUBLE,       /* 64-bit IEEE 754 */
+    ICB_STRING,
+    ICB_DATE,
+    ICB_TIME,
+    ICB_TIMESTAMP,
+    ICB_TIMESTAMPTZ,
+    ICB_BINARY,
+    ICB_DECIMAL,
+} IcebergType;
+
+static IcebergType PgTypeToIcebergType(Oid pg_type)
+{
+    switch (pg_type) {
+        case BOOLOID:       return ICB_BOOLEAN;
+        case INT2OID:
+        case INT4OID:       return ICB_INT;
+        case INT8OID:       return ICB_LONG;
+        case FLOAT4OID:     return ICB_FLOAT;
+        case FLOAT8OID:     return ICB_DOUBLE;
+        case DATEOID:       return ICB_DATE;
+        case TIMEOID:       return ICB_TIME;
+        case TIMESTAMPOID:  return ICB_TIMESTAMP;
+        case TIMESTAMPTZOID:return ICB_TIMESTAMPTZ;
+        case BYTEAOID:      return ICB_BINARY;
+        case NUMERICOID:    return ICB_DECIMAL;
+        default:            return ICB_STRING;
+    }
+}
+
+/* ──── 辅助：穿透 RelabelType 获取底层节点 ──── */
+
+static Node* StripRelabelType(Node* node)
+{
+    while (node != NULL && IsA(node, RelabelType))
+        node = (Node*)((RelabelType*)node)->arg;
+    return node;
+}
+
+/* ──── 前向声明 ──── */
+
+static void AppendFilterExpr(StringInfo buf, Node* node, PlannerInfo* root,
+                              int targetRti, bool* hasError,
+                              Oid column_pg_type);
+
+/* ════════════════════════════════════════════════════════════════════
+ * AppendFilterConst — 按 Iceberg 列类型序列化字面量
+ *
+ * column_pg_type: 该字面量对应列（在 col OP const 比较中）的 PG 类型。
+ *   InvalidOid 表示无列上下文（如 AND/OR 分支），退回到 con->consttype。
+ *
+ * 精度降级: 若 column_pg_type 比 con->consttype 窄（如列 float4/const float8），
+ *   先将 Datum 转换到列精度再序列化。
+ *
+ * 序列化规则（按 Iceberg 类型）:
+ *   ICB_BOOLEAN          → True / False
+ *   ICB_INT              → %d
+ *   ICB_LONG             → %ld
+ *   ICB_FLOAT            → %.17g  (17 位有效数字, 保证 float4 往返)
+ *   ICB_DOUBLE           → %.17g  (17 位有效数字, 保证 float8 往返)
+ *   ICB_STRING           → 单引号包围 + 内部单引号双写转义
+ *   ICB_DATE/TIME/TS/... → PG output 函数 → 单引号包围
+ *   NULL                 → None
+ * ════════════════════════════════════════════════════════════════════ */
+
+static void AppendFilterConst(StringInfo buf, Const* con, Oid column_pg_type)
 {
     if (con->constisnull) {
         appendStringInfoString(buf, "None");
         return;
     }
-    switch (con->consttype) {
-        case INT2OID:
-        case INT4OID:
-            appendStringInfo(buf, "%d", DatumGetInt32(con->constvalue));
+
+    /* 列类型优先，回退 consttype */
+    Oid effective_type = OidIsValid(column_pg_type) ? column_pg_type : con->consttype;
+    IcebergType ice_type = PgTypeToIcebergType(effective_type);
+
+    switch (ice_type) {
+        case ICB_BOOLEAN:
+            appendStringInfoString(buf,
+                DatumGetBool(con->constvalue) ? "True" : "False");
             break;
-        case INT8OID:
-            appendStringInfo(buf, "%ld", (long)DatumGetInt64(con->constvalue));
+
+        case ICB_INT: {
+            int32 val;
+            if (con->consttype == FLOAT8OID)
+                val = (int32)DatumGetFloat8(con->constvalue);
+            else if (con->consttype == FLOAT4OID)
+                val = (int32)DatumGetFloat4(con->constvalue);
+            else
+                val = DatumGetInt32(con->constvalue);
+            appendStringInfo(buf, "%d", val);
             break;
-        case FLOAT4OID:
-            appendStringInfo(buf, "%f", DatumGetFloat4(con->constvalue));
+        }
+
+        case ICB_LONG: {
+            int64 val;
+            if (con->consttype == FLOAT8OID)
+                val = (int64)DatumGetFloat8(con->constvalue);
+            else if (con->consttype == FLOAT4OID)
+                val = (int64)DatumGetFloat4(con->constvalue);
+            else if (con->consttype == INT2OID || con->consttype == INT4OID)
+                val = (int64)DatumGetInt32(con->constvalue);
+            else
+                val = DatumGetInt64(con->constvalue);
+            appendStringInfo(buf, "%ld", (long)val);
             break;
-        case FLOAT8OID:
-            appendStringInfo(buf, "%f", DatumGetFloat8(con->constvalue));
+        }
+
+        case ICB_FLOAT: {
+            /* 先将 Datum 降至 float4 精度再序列化 */
+            float fval;
+            if (con->consttype == FLOAT8OID)
+                fval = (float)DatumGetFloat8(con->constvalue);
+            else if (con->consttype == FLOAT4OID)
+                fval = DatumGetFloat4(con->constvalue);
+            else if (con->consttype == INT2OID || con->consttype == INT4OID)
+                fval = (float)DatumGetInt32(con->constvalue);
+            else if (con->consttype == INT8OID)
+                fval = (float)DatumGetInt64(con->constvalue);
+            else
+                fval = (float)DatumGetFloat8(con->constvalue);
+            appendStringInfo(buf, "%.17g", (double)fval);
             break;
-        case TEXTOID:
-        case VARCHAROID:
-        case BPCHAROID: {
-            char* str = TextDatumGetCString(con->constvalue);
+        }
+
+        case ICB_DOUBLE: {
+            double dval;
+            if (con->consttype == FLOAT4OID)
+                dval = (double)DatumGetFloat4(con->constvalue);
+            else if (con->consttype == FLOAT8OID)
+                dval = DatumGetFloat8(con->constvalue);
+            else if (con->consttype == INT2OID || con->consttype == INT4OID)
+                dval = (double)DatumGetInt32(con->constvalue);
+            else if (con->consttype == INT8OID)
+                dval = (double)DatumGetInt64(con->constvalue);
+            else
+                dval = DatumGetFloat8(con->constvalue);
+            appendStringInfo(buf, "%.17g", dval);
+            break;
+        }
+
+        case ICB_STRING: {
+            char* str;
+            if (con->consttype == TEXTOID || con->consttype == VARCHAROID ||
+                con->consttype == BPCHAROID)
+                str = TextDatumGetCString(con->constvalue);
+            else
+                str = OidOutputFunctionCall(con->consttype, con->constvalue);
             appendStringInfoChar(buf, '\'');
-            /* escape embedded single quotes */
             for (char* p = str; *p; p++) {
                 if (*p == '\'') appendStringInfoChar(buf, '\'');
                 appendStringInfoChar(buf, *p);
@@ -107,6 +244,13 @@ static void AppendFilterConst(StringInfo buf, Const* con)
             pfree(str);
             break;
         }
+
+        case ICB_DATE:
+        case ICB_TIME:
+        case ICB_TIMESTAMP:
+        case ICB_TIMESTAMPTZ:
+        case ICB_DECIMAL:
+        case ICB_BINARY:
         default: {
             char* str = OidOutputFunctionCall(con->consttype, con->constvalue);
             appendStringInfoChar(buf, '\'');
@@ -118,6 +262,10 @@ static void AppendFilterConst(StringInfo buf, Const* con)
     }
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ * AppendFilterOpExpr — 比较表达式，识别 col OP const 模式并传递列类型
+ * ════════════════════════════════════════════════════════════════════ */
+
 static void AppendFilterOpExpr(StringInfo buf, OpExpr* opexpr, PlannerInfo* root,
                                 int targetRti, bool* hasError)
 {
@@ -128,8 +276,31 @@ static void AppendFilterOpExpr(StringInfo buf, OpExpr* opexpr, PlannerInfo* root
     Node* left  = (Node*)linitial(opexpr->args);
     Node* right = (Node*)lsecond(opexpr->args);
 
+    /*
+     * 检测 col OP const 模式: 穿透 RelabelType 判断底层是否是 Var/Const。
+     * 列类型从 Var 侧取，传递给 Const 侧，确保字面量序列化精度与列一致。
+     */
+    Node* raw_left  = StripRelabelType(left);
+    Node* raw_right = StripRelabelType(right);
+    Oid col_pg_type = InvalidOid;
+
+    if (IsA(raw_left, Var) && (IsA(raw_right, Const) || IsA(right, RelabelType))) {
+        Var* var = (Var*)raw_left;
+        if ((int)var->varno == targetRti) {
+            RangeTblEntry* rte = rt_fetch(targetRti, root->parse->rtable);
+            col_pg_type = get_atttype(rte->relid, var->varattno);
+        }
+    } else if (IsA(raw_right, Var) && (IsA(raw_left, Const) || IsA(left, RelabelType))) {
+        Var* var = (Var*)raw_right;
+        if ((int)var->varno == targetRti) {
+            RangeTblEntry* rte = rt_fetch(targetRti, root->parse->rtable);
+            col_pg_type = get_atttype(rte->relid, var->varattno);
+        }
+    }
+
     appendStringInfoChar(buf, '(');
-    AppendFilterExpr(buf, left, root, targetRti, hasError);
+    /* Var 侧传 InvalidOid（列引用不需要列类型），Const 侧传 col_pg_type */
+    AppendFilterExpr(buf, left, root, targetRti, hasError, InvalidOid);
     if (*hasError) return;
 
     const char* opname = get_opname(opexpr->opno);
@@ -155,13 +326,19 @@ static void AppendFilterOpExpr(StringInfo buf, OpExpr* opexpr, PlannerInfo* root
         return;
     }
 
-    AppendFilterExpr(buf, right, root, targetRti, hasError);
+    AppendFilterExpr(buf, right, root, targetRti, hasError,
+                     (IsA(raw_left, Var) && raw_right != NULL) ? col_pg_type : InvalidOid);
     if (*hasError) return;
     appendStringInfoChar(buf, ')');
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ * AppendFilterExpr — 递归分发
+ * ════════════════════════════════════════════════════════════════════ */
+
 static void AppendFilterExpr(StringInfo buf, Node* node, PlannerInfo* root,
-                              int targetRti, bool* hasError)
+                              int targetRti, bool* hasError,
+                              Oid column_pg_type)
 {
     if (node == NULL || *hasError) return;
 
@@ -178,7 +355,7 @@ static void AppendFilterExpr(StringInfo buf, Node* node, PlannerInfo* root,
             foreach (lc, bexpr->args) {
                 if (!first) appendStringInfoString(buf, joiner);
                 first = false;
-                AppendFilterExpr(buf, (Node*)lfirst(lc), root, targetRti, hasError);
+                AppendFilterExpr(buf, (Node*)lfirst(lc), root, targetRti, hasError, InvalidOid);
                 if (*hasError) return;
             }
             appendStringInfoChar(buf, ')');
@@ -201,10 +378,11 @@ static void AppendFilterExpr(StringInfo buf, Node* node, PlannerInfo* root,
             break;
         }
         case T_Const:
-            AppendFilterConst(buf, (Const*)node);
+            AppendFilterConst(buf, (Const*)node, column_pg_type);
             break;
         case T_RelabelType:
-            AppendFilterExpr(buf, (Node*)((RelabelType*)node)->arg, root, targetRti, hasError);
+            AppendFilterExpr(buf, (Node*)((RelabelType*)node)->arg,
+                             root, targetRti, hasError, column_pg_type);
             break;
         default:
             *hasError = true;
@@ -238,7 +416,7 @@ static char* BuildFilterFromWhere(PlannerInfo* root, int targetRti,
         Node* qual = (Node*)lfirst(lc);
         if (!first) appendStringInfoString(&buf, " AND ");
         first = false;
-        AppendFilterExpr(&buf, qual, root, targetRti, &hasError);
+        AppendFilterExpr(&buf, qual, root, targetRti, &hasError, InvalidOid);
         if (hasError) {
             pfree(buf.data);
             ereport(ERROR,
