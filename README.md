@@ -72,6 +72,32 @@ openGauss 扩展插件，通过 FDW 机制实现 Iceberg 外表的 INSERT 截流
 | `flush.cpp` | `iceberg_delta_flush` 落湖实现 + S3 配置解析 |
 | `fdw_options.cpp` | 外表选项校验器 |
 
+### 插件如何挂入 openGauss
+
+插件通过 `_PG_init` 在 postmaster 启动时注册一个 `ProcessUtility_hook`，从而在所有 DDL 语句执行前获得拦截机会：
+
+```cpp
+// iceberg_delta.cpp —— 扩展加载入口
+ProcessUtility_hook_type prev_ProcessUtility = NULL;   // 保存原 hook，卸载时还原
+
+// 拦截器：所有 utility 语句（CREATE/DROP 等）都会先经过这里
+static void IcebergDeltaProcessUtility(processutility_context* pucontext,
+                                       DestReceiver* dest, ...) {
+    IcebergDeltaDDLHook(...);   // 只处理本插件关心的 CREATE/DROP FOREIGN TABLE，其余透传
+}
+
+void _PG_init(void) {
+    prev_ProcessUtility = ProcessUtility_hook;      // 记住上一个 hook（hook 链）
+    ProcessUtility_hook = IcebergDeltaProcessUtility;  // 把自己挂到链头
+}
+
+void _PG_fini(void) {
+    ProcessUtility_hook = prev_ProcessUtility;     // 卸载时还原，保证可热插拔
+}
+```
+
+> 因为 hook 必须在 postmaster 启动时安装，所以 `shared_preload_libraries = 'iceberg_delta'` 是硬性要求——仅在会话里 `CREATE EXTENSION` 不够。
+
 ---
 
 ## 三、功能详解
@@ -107,6 +133,63 @@ CREATE FOREIGN TABLE t (id int, name text, ...) SERVER iceberg_server OPTIONS (.
                 ADD delta_relid '<oid>', ADD delta_schema '...', ADD delta_name '...')
             把 delta 表信息缓存进外表 options，后续 INSERT/flush 零 SPI 查询即可定位
 ```
+
+#### 代码片段：DDL Hook 拦截与建表
+
+hook 只对 `iceberg_server` 上的外表生效，其余 DDL 透传给内核：
+
+```cpp
+// ddl_hook.cpp —— 拦截 CREATE FOREIGN TABLE
+void IcebergDeltaDDLHook(processutility_context* pucontext, ...) {
+    Node* parsetree = pucontext->parse_tree;
+
+    if (IsA(parsetree, CreateForeignTableStmt)) {
+        CreateForeignTableStmt* stmt = (CreateForeignTableStmt*)parsetree;
+        // 关键：只接管 server 名为 "iceberg_server" 的外表，其他外表交给内核
+        if (IsIcebergServerByName(stmt->servername)) {
+            CallNextUtility(...);                       // ① 先让内核把外表建好
+            IcebergDeltaHandleCreateForeignTable(stmt); // ② 再自动建 delta 表 + 映射
+            return;
+        }
+    }
+    CallNextUtility(...);  // 非 iceberg 的语句：原样放行
+}
+```
+
+delta 表的建表语句由列结构复制而成，固定为 USTORE（行存内存表）：
+
+```cpp
+// delta_table.cpp —— 按外表列结构生成 delta 表的 CREATE TABLE
+StringInfoData buf;
+initStringInfo(&buf);
+appendStringInfo(&buf, "CREATE TABLE %s.%s (",
+                 quote_identifier(schema_name),   // 固定 schema = "iceberg_delta"
+                 quote_identifier(table_name));    // 表名 = "<外表名>_delta"
+
+// 逐列复制外表的列名 + 类型，结构与外表完全一致
+for (int i = 0; i < tupdesc->natts; i++) {
+    Form_pg_attribute attr = &tupdesc->attrs[i];
+    if (attr->attisdropped) continue;              // 跳过已删除列
+    appendStringInfo(&buf, "%s %s",
+                     quote_identifier(NameStr(attr->attname)),
+                     format_type_be(attr->atttypid));
+}
+appendStringInfoString(&buf, ") WITH (STORAGE_TYPE = USTORE)");  // USTORE = 内存行存，支持原地更新
+
+SPI_execute(buf.data, false, 0);   // 在插件事务内执行建表
+```
+
+随后记录"delta 依赖外表"的自动依赖——外表 DROP 时 delta 表随之级联删除：
+
+```cpp
+// ddl_hook.cpp —— 注册级联删除依赖
+ObjectAddress delta_addr, ft_addr;
+ObjectAddressSet(delta_addr, RelationRelationId, delta_relid);  // delta 表（依赖方）
+ObjectAddressSet(ft_addr,    RelationRelationId, foreign_relid); // 外表（被依赖方）
+recordDependencyOn(&delta_addr, &ft_addr, DEPENDENCY_AUTO);       // AUTO：外表删 → delta 删
+```
+
+> 之后 hook 还会把 `delta_relid/delta_schema/delta_name` 通过 `ALTER FOREIGN TABLE ... OPTIONS (ADD ...)` 写进外表 options，作为零 SPI 查询的缓存（见 `fdw_modify.cpp`）。
 
 #### delta 内表命名规则
 
@@ -162,6 +245,40 @@ INSERT INTO t VALUES (...)
             返回 slot → 支持 RETURNING 子句
 ```
 
+#### 代码片段：INSERT 截流实现
+
+截流的全部工作就在 `ExecForeignInsert` 这一个回调里——三步把数据写进 delta 表，全程不碰远端 Iceberg：
+
+```cpp
+// fdw_modify.cpp —— INSERT 截流点（每插入一行调用一次）
+TupleTableSlot* IcebergDeltaExecForeignInsert(EState* estate, ResultRelInfo* rinfo,
+                                              TupleTableSlot* slot, TupleTableSlot* planSlot) {
+    IcebergDeltaFdwModifyState* st = (IcebergDeltaFdwModifyState*)rinfo->ri_FdwState;
+
+    // ① 从待插入 slot 提取全部属性值（解构成 Datum 数组）
+    heap_slot_getallattrs(slot, false);
+
+    // ② 按外表列结构，把 Datum 数组转成 USTORE 存储格式的物理 tuple
+    Tuple tuple = tableam_tslot_get_tuple_from_slot(st->delta_rel, slot);
+
+    // ③ 写入本地 delta 内表（不是远端 Iceberg！）—— 走标准 tableam 插入路径
+    (void)tableam_tuple_insert(st->delta_rel, tuple, estate->es_output_cid, 0, NULL);
+
+    return slot;  // 返回 slot，支持 INSERT ... RETURNING
+}
+```
+
+INSERT 能走到这里的门槛是"外表声明自己可 INSERT"——`IsForeignRelUpdatable` 返回带 `CMD_INSERT` 的位掩码：
+
+```cpp
+// fdw_modify.cpp —— 告知 planner/executor：本外表支持哪些 DML
+int IcebergDeltaIsForeignRelUpdatable(Relation rel) {
+    return (1 << CMD_INSERT) | (1 << CMD_DELETE);  // 位掩码：每一位对应一种命令类型
+}
+```
+
+> 上面 `CMD_DELETE` 的存在是为了支持 DELETE 功能（本 README 未展开）。若内核 FDW 白名单未含 `iceberg_fdw`，`CMD_INSERT` 这一位会被 planner 在更早阶段直接拒掉，根本到不了 `ExecForeignInsert`——这就是第四节内核改动的由来。
+
 #### 关键点
 
 - **截流而非转发**：`ExecForeignInsert` 是天然截流点，数据只进本地 delta 表，不产生任何远端 Iceberg I/O。
@@ -210,6 +327,58 @@ iceberg_delta_flush('t')
         ▼ 6. 清空 delta 缓冲区
             DeleteDeltaRows(delta, ctids)  按物理位置删 delta 行 + CommandCounterIncrement
             返回 nrows
+```
+
+#### 代码片段：懒创建与 Append
+
+首次 flush 时 Iceberg 表可能尚不存在，用"先 Open，失败则 Create"的模式实现懒创建——表结构与 delta 表一致：
+
+```cpp
+// flush.cpp —— 懒创建：首次 flush 才在 S3 上真正建表
+iceberg_lite::IcebergTable iceberg_table = [&]() {
+    try {
+        return iceberg_lite::IcebergTable::Open(s3_client, table_path);  // 尝试打开已有表
+    } catch (const std::exception&) {
+        // 打开失败 = 表不存在：用 delta 表的 schema 现场创建一张 Iceberg 表
+        iceberg_lite::Schema schema = BuildIcebergSchemaFromTupleDesc(tupdesc);
+        return iceberg_lite::IcebergTable::Create(s3_client, table_path, schema);
+    }
+}();
+
+// 批量追加：一次 Append 把所有缓冲行写成一个 Parquet 文件并提交新 snapshot
+try {
+    iceberg_table.Append(records);   // records 来自对 delta 表的扫描结果
+} catch (const std::exception& e) {
+    ereport(ERROR, (errcode(ERRCODE_FDW_ERROR),
+                    errmsg("failed to append records to iceberg table: %s", e.what())));
+}
+
+// Append 成功后才删 delta 行；若后续事务回滚，删除也回滚，依赖 Iceberg 提交的原子性
+DeleteDeltaRows(delta_rel, ctids, nrows);
+```
+
+S3 凭证按"options → 环境变量 → 默认值"三级解析，access_key/secret 无默认、缺失即报错：
+
+```cpp
+// flush.cpp —— 三级凭证解析（options 最高，环境变量次之，默认值兜底）
+static const char* ResolveS3Option(List* options, const char* opt_name,
+                                   const char* env_name, const char* fallback) {
+    const char* from_opt = GetOptionString(options, opt_name);   // ① 外表 options
+    if (from_opt != NULL && from_opt[0] != '\0') return from_opt;
+
+    const char* from_env = getenv(env_name);                      // ② 环境变量
+    if (from_env != NULL && from_env[0] != '\0') return from_env;
+
+    return fallback;                                             // ③ 默认值（ak/sk 传 NULL）
+}
+
+// access_key 不留默认值：三级都没给就直接报错，杜绝凭证进源码
+const char* ak = ResolveS3Option(options, ICEBERG_OPT_S3_ACCESS_KEY_ID,
+                                 ENV_S3_ACCESS_KEY_ID, NULL);
+if (ak == NULL) {
+    ereport(ERROR, (errmsg("iceberg_delta: S3 access key not provided; "
+                           "set option 's3_access_key_id' or env ICEBERG_S3_ACCESS_KEY_ID")));
+}
 ```
 
 #### S3 凭证解析优先级（三级，从高到低）
