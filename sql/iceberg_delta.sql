@@ -38,7 +38,7 @@ SELECT delta_schema, delta_name FROM iceberg_delta.mapping WHERE foreign_relid =
 
 -- Verify DEPENDENCY_AUTO was registered
 SELECT deptype FROM pg_depend WHERE objid = (
-    SELECT oid FROM pg_class WHERE relname LIKE 'delta_%' AND relnamespace = (
+    SELECT oid FROM pg_class WHERE relname LIKE '%_delta' AND relnamespace = (
         SELECT oid FROM pg_namespace WHERE nspname = 'iceberg_delta'
     )
 ) AND refobjid = (
@@ -52,7 +52,7 @@ DROP FOREIGN TABLE t_test_insert;
 SELECT count(*) FROM iceberg_delta.mapping;
 
 -- Verify delta internal table was auto-cascaded
-SELECT count(*) FROM pg_class WHERE relname LIKE 'delta_%' AND relnamespace = (
+SELECT count(*) FROM pg_class WHERE relname LIKE '%_delta' AND relnamespace = (
     SELECT oid FROM pg_namespace WHERE nspname = 'iceberg_delta'
 );
 
