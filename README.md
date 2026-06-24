@@ -19,7 +19,7 @@ CREATE FOREIGN TABLE t_sales (
 INSERT INTO t_sales VALUES (1, 'alice', 95.5);
 
 -- 通过 Delta 内表直接查询新写入的数据
-SELECT * FROM iceberg_delta.delta_<oid>;
+SELECT * FROM iceberg_delta.t_sales_delta;
 
 -- 删除外表时 Delta 内表自动级联删除
 DROP FOREIGN TABLE t_sales;

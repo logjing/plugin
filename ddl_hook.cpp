@@ -120,7 +120,31 @@ static void IcebergDeltaHandleCreateForeignTable(CreateForeignTableStmt* stmt)
     TupleDesc tupdesc = RelationGetDescr(rel);
 
     char delta_name[NAMEDATALEN];
-    snprintf(delta_name, sizeof(delta_name), "delta_%u", foreign_relid);
+    {
+        char* foreign_relname = get_rel_name(foreign_relid);
+        int name_len = strlen(foreign_relname);
+        /* _delta = 6 chars; need room for NUL ⇒ max table name = NAMEDATALEN - 7 */
+        if (name_len > NAMEDATALEN - 7) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NAME_TOO_LONG),
+                     errmsg("foreign table name \"%s\" is too long to generate "
+                            "delta table name (max %d characters)",
+                            foreign_relname, NAMEDATALEN - 7)));
+        }
+        snprintf(delta_name, sizeof(delta_name), "%s_delta", foreign_relname);
+
+        /* Check for name collision in iceberg_delta schema */
+        Oid delta_ns_oid = get_namespace_oid(kDeltaSchemaName, false);
+        Oid existing = get_relname_relid(delta_name, delta_ns_oid);
+        if (OidIsValid(existing)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_DUPLICATE_TABLE),
+                     errmsg("delta table \"%s.%s\" already exists; "
+                            "another foreign table with the same name "
+                            "may exist in a different schema",
+                            kDeltaSchemaName, delta_name)));
+        }
+    }
 
     Oid delta_relid = IcebergDeltaTableCreate(foreign_relid,
                                                kDeltaSchemaName,

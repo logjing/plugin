@@ -40,7 +40,7 @@ CREATE FOREIGN TABLE t_test_insert (
 SELECT foreign_relid, delta_schema, delta_name FROM iceberg_delta.mapping;
  foreign_relid | delta_schema  |   delta_name
 ---------------+---------------+---------------
-           XXX | iceberg_delta | delta_XXX
+           XXX | iceberg_delta | t_test_insert_delta
 (1 row)
 
 -- Verify delta_relid option was written to foreign table
@@ -53,7 +53,7 @@ WHERE c.relname = 't_test_insert';
  table_name      | test_insert
  delta_relid     | XXX
  delta_schema    | iceberg_delta
- delta_name      | delta_XXX
+ delta_name      | t_test_insert_delta
 (5 rows)
 
 -- Insert data (should be intercepted into Delta internal table)
@@ -67,7 +67,7 @@ SELECT delta_schema, delta_name FROM iceberg_delta.mapping WHERE foreign_relid =
 );
  delta_schema  |   delta_name
 ---------------+---------------
- iceberg_delta | delta_XXX
+ iceberg_delta | t_test_insert_delta
 (1 row)
 
 -- Verify DEPENDENCY_AUTO was registered
@@ -119,7 +119,7 @@ SELECT delta_schema, delta_name FROM iceberg_delta.mapping WHERE foreign_relid =
 );
  delta_schema  |   delta_name
 ---------------+---------------
- iceberg_delta | delta_XXX
+ iceberg_delta | t_tx_test_delta
 (1 row)
 
 -- Test rollback
