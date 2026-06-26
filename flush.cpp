@@ -5,6 +5,14 @@
  * delta 表中的所有行写入 MinIO 上的 Iceberg 表，然后删除 delta 行。
  */
 
+/* undef PGXC c.h dngettext macro before any system includes */
+#ifdef dngettext
+#undef dngettext
+#endif
+#ifdef dgettext
+#undef dgettext
+#endif
+
 #include "postgres.h"
 #include "fmgr.h"
 
@@ -27,6 +35,7 @@
 #include "iceberg_delta/delta_table.h"
 #include "iceberg_delta/fdw_storage_options.h"
 #include "iceberg_delta/flush.h"
+#include "iceberg_delta/bridge_abi.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -558,93 +567,232 @@ Datum iceberg_delta_flush(PG_FUNCTION_ARGS)
 }
 
 /* ════════════════════════════════════════════════════════════════════
- * IcebergDeltaDeleteFromLake — 删除 Iceberg 数据湖中匹配的行
- *
- * 从 EndForeignModify 调用，处理 DELETE FROM <外表> 的落湖侧删除。
- * filter 是 PyIceberg 可解析的 SQL 表达式（如 "id == 1"）。
- * 异常通过 ereport 报告，调用者位于 PG 事务中。
+ * Bridge helpers + ConvertFilterToPredicateJson
+ * ════════════════════════════════════════════════════════════════════ */
+
+static void CheckBridge(IcebergBridgeStatus st, IcebergBridgeError* err,
+                        const char* ctx)
+{
+    if (st == ICEBERG_BRIDGE_OK) return;
+    if (err) {
+        const char* msg = iceberg_bridge_error_message(err);
+        ereport(ERROR,
+                (errcode(ERRCODE_FDW_ERROR),
+                 errmsg("bridge %s: %s", ctx, msg ? msg : "unknown")));
+    }
+    ereport(ERROR,
+            (errcode(ERRCODE_FDW_ERROR),
+             errmsg("bridge %s: status=%d", ctx, (int)st)));
+}
+
+static std::string GetBridgeString(IcebergBridgeString* s)
+{
+    if (!s) return "";
+    const char* data = iceberg_bridge_string_data(s);
+    std::string result(data ? data : "");
+    iceberg_bridge_string_free(s);
+    return result;
+}
+
+static void SafelyFreeTable(IcebergBridgeTable* t)  { if (t)  iceberg_bridge_table_free(t); }
+static void SafelyFreeTxn(IcebergBridgeTransaction* tx) { if (tx) iceberg_bridge_transaction_free(tx); }
+static void SafelyFreeStorage(IcebergBridgeStorage* s) { if (s) iceberg_bridge_storage_release(s); }
+
+static void AppendJsonKV(std::string& s, const char* key, const char* val, bool* first)
+{
+    if (!val || !val[0]) return;
+    if (!*first) s += ",";
+    *first = false;
+    s += "\""; s += key; s += "\":\"";
+    for (const char* p = val; *p; p++) {
+        if (*p == '"' || *p == '\\') s += '\\';
+        s += *p;
+    }
+    s += "\"";
+}
+
+static std::string BuildStorageConfigJson(ForeignTable* ft)
+{
+    std::string s = "{\"storage_scheme\":\"s3\"";
+    bool first = false;
+    AppendJsonKV(s, "s3_endpoint",          GetOptionString(ft->options, ICEBERG_OPT_S3_ENDPOINT), &first);
+    AppendJsonKV(s, "s3_access_key_id",      GetOptionString(ft->options, ICEBERG_OPT_S3_ACCESS_KEY_ID), &first);
+    AppendJsonKV(s, "s3_secret_access_key",  GetOptionString(ft->options, ICEBERG_OPT_S3_SECRET_ACCESS), &first);
+    AppendJsonKV(s, "s3_region",            GetOptionString(ft->options, ICEBERG_OPT_S3_REGION), &first);
+    AppendJsonKV(s, "s3_path_style_access",  GetOptionString(ft->options, ICEBERG_OPT_S3_PATH_STYLE), &first);
+    AppendJsonKV(s, "s3_ssl_enabled",        GetOptionString(ft->options, ICEBERG_OPT_S3_SSL_ENABLED), &first);
+    s += "}";
+    return s;
+}
+
+static IcebergBridgeTableIdent BuildTableIdent(ForeignTable* ft)
+{
+    IcebergBridgeTableIdent ident = {};
+    const char* tb = GetOptionString(ft->options, ICEBERG_OPT_TABLE_NAME);
+    if (tb) ident.name = tb;
+    return ident;
+}
+
+static std::string ConvertFilterToPredicateJson(const char* filter)
+{
+    std::string f(filter);
+    if (!f.empty() && f[0] == '(' && f[f.size()-1] == ')')
+        f = f.substr(1, f.size()-2);
+    size_t ap = f.find(" && ");
+    if (ap != std::string::npos) {
+        std::string l = ConvertFilterToPredicateJson(f.substr(0, ap).c_str());
+        std::string r = ConvertFilterToPredicateJson(f.substr(ap+4).c_str());
+        return "{\"type\":\"And\",\"left\":"+l+",\"right\":"+r+"}";
+    }
+    size_t q1 = f.find('"');
+    if (q1 != std::string::npos) {
+        size_t q2 = f.find('"', q1+1);
+        if (q2 != std::string::npos) {
+            std::string col = f.substr(q1+1, q2-q1-1);
+            std::string rest = f.substr(q2+1);
+            while (!rest.empty() && rest[0] == ' ') rest.erase(0,1);
+            std::string op, vs;
+            if      (rest.rfind("== ",0)==0) { op="EqualTo"; vs=rest.substr(3); }
+            else if (rest.rfind("!= ",0)==0) { op="NotEqualTo"; vs=rest.substr(3); }
+            else if (rest.rfind(">= ",0)==0) { op="GreaterThanOrEqual"; vs=rest.substr(3); }
+            else if (rest.rfind("<= ",0)==0) { op="LessThanOrEqual"; vs=rest.substr(3); }
+            else if (rest.rfind("> ", 0)==0) { op="GreaterThan"; vs=rest.substr(2); }
+            else if (rest.rfind("< ", 0)==0) { op="LessThan"; vs=rest.substr(2); }
+            if (!op.empty()) {
+                while (!vs.empty() && vs[0] == ' ') vs.erase(0,1);
+                while (!vs.empty() && vs.back() == ' ') vs.pop_back();
+                bool num = !vs.empty() && (vs[0]=='-' || vs[0]=='.' || isdigit(vs[0]));
+                return "{\"type\":\""+op+"\",\"term\":\""+col+"\",\"value\":"+(num?vs:("\""+vs+"\""))+"}";
+            }
+        }
+    }
+    return "{\"type\":\"AlwaysTrue\"}";
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * IcebergDeltaDeleteFromLake — V3 position-delete via rust bridge
  * ════════════════════════════════════════════════════════════════════ */
 
 void IcebergDeltaDeleteFromLake(Oid foreign_relid, const char* filter)
 {
-    if (filter == NULL || filter[0] == '\0') {
-        /* empty filter = delete all rows from Iceberg */
-    }
+    if (filter == NULL || filter[0] == '\0') return;
+
+    IcebergBridgeStorage*     storage  = NULL;
+    IcebergBridgeTable*       table    = NULL;
+    IcebergBridgeTransaction* tx       = NULL;
+    IcebergBridgeString*      pos_json = NULL;
+    IcebergBridgeString*      dv_json  = NULL;
+    IcebergBridgeError*       err      = NULL;
+    std::vector<std::string>  dv_jsons;
 
     Relation foreign_rel = NULL;
-    MemoryContext oldctx;
     MemoryContext delete_ctx = AllocSetContextCreate(CurrentMemoryContext,
-                                                      "iceberg_delta delete context",
-                                                      ALLOCSET_DEFAULT_MINSIZE,
-                                                      ALLOCSET_DEFAULT_INITSIZE,
-                                                      ALLOCSET_DEFAULT_MAXSIZE);
+        "iceberg_delta bridge delete", ALLOCSET_DEFAULT_MINSIZE,
+        ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+    MemoryContext oldctx = MemoryContextSwitchTo(delete_ctx);
 
     PG_TRY();
     {
-        oldctx = MemoryContextSwitchTo(delete_ctx);
-
-        /* ── 1. 打开外表，提取 S3 选项 ── */
         foreign_rel = relation_open(foreign_relid, AccessShareLock);
         ForeignTable* ft = GetForeignTable(foreign_relid);
 
-        const char* location = GetOptionString(ft->options, ICEBERG_OPT_LOCATION);
-        if (location == NULL) {
-            const char* warehouse = GetOptionString(ft->options, ICEBERG_OPT_WAREHOUSE);
-            const char* table_name = GetOptionString(ft->options, ICEBERG_OPT_TABLE_NAME);
-            if (warehouse == NULL || table_name == NULL) {
-                ereport(ERROR,
-                        (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                         errmsg("iceberg_delta DELETE requires 'location' option "
-                                "or 'warehouse' + 'table_name' options")));
+        const char* loc = GetOptionString(ft->options, ICEBERG_OPT_LOCATION);
+        std::string full_loc;
+        if (!loc) {
+            const char* w = GetOptionString(ft->options, ICEBERG_OPT_WAREHOUSE);
+            const char* t = GetOptionString(ft->options, ICEBERG_OPT_TABLE_NAME);
+            if (!w || !t) ereport(ERROR,(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                errmsg("DELETE requires location or warehouse+table_name")));
+            full_loc = std::string(w)+"/"+t;
+            loc = full_loc.c_str();
+        }
+        std::string ml = std::string(loc)+"/metadata";
+
+        std::string scfg = BuildStorageConfigJson(ft);
+        CheckBridge(iceberg_bridge_storage_open(scfg.c_str(),&storage,&err),err,"storage_open");
+
+        IcebergBridgeTableIdent ident = BuildTableIdent(ft);
+
+        std::string pred = ConvertFilterToPredicateJson(filter);
+        CheckBridge(iceberg_bridge_scan_positions(storage,ml.c_str(),&ident,
+                     pred.c_str(),&pos_json,&err),err,"scan_positions");
+        std::string pj = GetBridgeString(pos_json);
+
+        /* parse [{"file":"...","positions":[...]}] */
+        const char* pp = pj.c_str();
+        while (*pp==' '||*pp=='\n') pp++;
+        if (*pp!='[') ereport(ERROR,(errcode(ERRCODE_FDW_ERROR),
+                            errmsg("scan_positions: expected JSON array")));
+        pp++;
+        char dvp[2048];
+        std::string cur_f; std::vector<uint64_t> pv;
+        while (*pp) {
+            while (*pp==' '||*pp=='\n'||*pp=='\t'||*pp==',') pp++;
+            if (*pp==']') break;
+            if (*pp=='{') { cur_f.clear(); pv.clear(); pp++;
+                while (*pp && *pp!='}') {
+                    while (*pp==' '||*pp==','||*pp=='"') pp++;
+                    std::string k; while (*pp&&*pp!='"'){k+=*pp;pp++;} if(*pp=='"')pp++;
+                    while (*pp==' '||*pp==':') pp++;
+                    if (k=="file") { if(*pp=='"')pp++; while(*pp&&*pp!='"'){cur_f+=*pp;pp++;} if(*pp=='"')pp++; }
+                    else if (k=="positions") { while (*pp==' '||*pp=='[') pp++;
+                        while (*pp&&*pp!=']') { while(*pp==' '||*pp==',')pp++; std::string n;
+                            while(*pp>='0'&&*pp<='9'){n+=*pp;pp++;} if(!n.empty())pv.push_back((uint64_t)atoll(n.c_str())); }
+                        if(*pp==']')pp++; }
+                }
+                if(*pp=='}')pp++;
+                if(!cur_f.empty()&&!pv.empty()){
+                    snprintf(dvp,sizeof(dvp),"%s.dv-%08llx.puffin",cur_f.c_str(),(unsigned long long)pv[0]);
+                    CheckBridge(iceberg_bridge_write_delete_vector(storage,pv.data(),pv.size(),
+                        dvp,cur_f.c_str(),&dv_json,&err),err,"write_delete_vector");
+                    dv_jsons.push_back(GetBridgeString(dv_json));
+                }
             }
-            StringInfoData locbuf;
-            initStringInfo(&locbuf);
-            appendStringInfo(&locbuf, "%s/%s", warehouse, table_name);
-            location = locbuf.data;
         }
 
-        std::string bucket, table_path;
-        if (!ParseS3Location(location, bucket, table_path) || bucket.empty()) {
-            ereport(ERROR,
-                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                     errmsg("invalid iceberg_delta location: \"%s\"; "
-                            "expected s3://bucket/table_path format", location)));
+        /* commit via catalog */
+        {
+            IcebergBridgeCatalog* cat = NULL;
+            CheckBridge(iceberg_bridge_catalog_open("memory","{}",&cat,&err),err,"catalog_open");
+            const char* tn = ident.name?ident.name:"unknown";
+            std::string ij = "{\"name\":\""+std::string(tn)+"\",\"namespace\":[\"iceberg_delta\"]}";
+            CheckBridge(iceberg_bridge_catalog_register_table(cat,ij.c_str(),ml.c_str(),NULL,&err),err,"catalog_register");
+            CheckBridge(iceberg_bridge_catalog_load_table(cat,ij.c_str(),&table,&err),err,"catalog_load");
+
+            CheckBridge(iceberg_bridge_transaction_new(table,&tx,&err),err,"transaction_new");
+            std::string djs = "[";
+            for (size_t i=0;i<dv_jsons.size();i++){ if(i>0)djs+=","; djs+=dv_jsons[i]; }
+            djs+="]";
+            CheckBridge(iceberg_bridge_transaction_row_delta(tx,"[]",djs.c_str(),"[]",&err),err,"row_delta");
+
+            IcebergBridgeTable* nt = NULL;
+            CheckBridge(iceberg_bridge_transaction_commit(cat,tx,&nt,&err),err,"commit");
+            tx = NULL; /* consumed */
+
+            IcebergBridgeString* nml = NULL;
+            CheckBridge(iceberg_bridge_table_metadata_location(nt,&nml,&err),err,"metadata_location");
+            std::string nl = GetBridgeString(nml);
+            /* TODO: SPI UPDATE iceberg_delta.mapping SET metadata_location = nl */
+            (void)nl;
+            SafelyFreeTable(nt);
+            iceberg_bridge_catalog_release(cat);
         }
 
-        /* ── 2. 连接 S3，打开 Iceberg 表 ── */
-        iceberg_lite::S3Config s3_conf = BuildS3Config(ft->options, bucket);
-        iceberg_lite::S3Client s3_client(s3_conf);
-
-        try {
-            iceberg_lite::IcebergTable iceberg_table =
-                iceberg_lite::IcebergTable::Open(s3_client, table_path);
-
-            /* ── 3. 删除匹配行 ── */
-            if (filter != NULL && filter[0] != '\0') {
-                iceberg_table.Delete(std::string(filter));
-            } else {
-                /* empty filter = delete all */
-                iceberg_table.Delete(std::string("True"));
-            }
-        } catch (const std::exception& e) {
-            ereport(ERROR,
-                    (errcode(ERRCODE_FDW_ERROR),
-                     errmsg("failed to delete from iceberg table: %s",
-                            e.what())));
-        }
-
+        SafelyFreeTxn(tx);
+        SafelyFreeTable(table);
+        SafelyFreeStorage(storage);
+        if (foreign_rel) relation_close(foreign_rel, AccessShareLock);
         MemoryContextSwitchTo(oldctx);
     }
     PG_CATCH();
     {
-        if (foreign_rel != NULL)
-            relation_close(foreign_rel, AccessShareLock);
+        SafelyFreeTxn(tx);
+        SafelyFreeTable(table);
+        SafelyFreeStorage(storage);
+        if (foreign_rel) relation_close(foreign_rel, AccessShareLock);
         MemoryContextDelete(delete_ctx);
         PG_RE_THROW();
     }
     PG_END_TRY();
-
-    if (foreign_rel != NULL)
-        relation_close(foreign_rel, AccessShareLock);
     MemoryContextDelete(delete_ctx);
 }
